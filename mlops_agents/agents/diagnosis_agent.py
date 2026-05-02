@@ -22,7 +22,7 @@ from langchain_ollama import ChatOllama
 from langchain_core.messages import HumanMessage, SystemMessage
 
 from state import AgentState
-from rag.store import RAGStore
+from mlops_agents.rag.store import RAGStore
 
 logger = logging.getLogger(__name__)
 

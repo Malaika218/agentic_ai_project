@@ -25,7 +25,7 @@ from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
 
 from state import AgentState
-from rag.store import RAGStore
+from mlops_agents.rag.store import RAGStore
 from agents.monitor_agent import monitor_agent
 from agents.diagnosis_agent import diagnosis_agent
 from agents.remediation_agent import remediation_agent
