@@ -54,7 +54,25 @@ def remediation_agent(state: AgentState) -> AgentState:
     else:
         # Standard deterministic dispatch
         if action == "retrain":
-            result = trigger_retraining_pipeline(model_id=model_id, environment=environment, reason=diagnosis)
+            prescription = state.get("retrain_prescription") or {}
+            metrics      = state.get("metrics") or {}
+
+            # derive data window from drift onset if available
+            drift_onset  = state.get("drift_onset_at")
+            if drift_onset and not prescription.get("window_days"):
+                from datetime import datetime, timezone
+                onset_dt     = datetime.fromisoformat(drift_onset)
+                days_drifting = (datetime.now(timezone.utc) - onset_dt).days
+                prescription["window_days"] = max(14, days_drifting + 7)
+
+            result = trigger_retraining_pipeline(
+                model_id=model_id,
+                environment=environment,
+                reason=diagnosis,
+                severity=severity,
+                prescription=prescription,
+                current_metrics=metrics,
+            )
         elif action == "rollback":
             result = rollback_deployment(model_id=model_id, environment=environment, reason=diagnosis)
         elif action == "scale":

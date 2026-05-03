@@ -34,59 +34,104 @@ class ToolExecutionError(Exception):
 # ---------------------------------------------------------------------------
 
 def trigger_retraining_pipeline(
-    model_id: str,
-    environment: str,
-    reason: str,
-    triggered_by: str = "mlops-agent",
+    model_id:        str,
+    environment:     str,
+    reason:          str,
+    severity:        str          = "unknown",
+    prescription:    dict         = None,
+    current_metrics: dict         = None,
+    triggered_by:    str          = "mlops-agent",
 ) -> dict[str, Any]:
     """
-    Dispatch a GitHub Actions workflow to retrain the model.
-
-    Required env vars:
-        GITHUB_TOKEN
-        GITHUB_OWNER
-        GITHUB_REPO
-        GITHUB_RETRAIN_WORKFLOW_ID   — workflow filename, e.g. "retrain.yml"
-        GITHUB_DEFAULT_BRANCH        — default: "main"
+    Dispatch a GitHub Actions workflow to retrain the model,
+    forwarding the full structured retrain prescription.
     """
-    try:
-        import requests
+    import json, requests
 
-        token = os.environ["GITHUB_TOKEN"]
-        owner = os.environ["GITHUB_OWNER"]
-        repo = os.environ["GITHUB_REPO"]
+    prescription     = prescription or {}
+    current_metrics  = current_metrics or {}
+
+    # check if retrain already in progress — avoid duplicate dispatches
+    if _is_retrain_in_progress():
+        logger.info("Retrain already in progress — skipping dispatch.")
+        return {
+            "status": "skipped",
+            "detail": "Retrain workflow already in progress.",
+        }
+
+    try:
+        token       = os.environ["GITHUB_TOKEN"]
+        owner       = os.environ["GITHUB_OWNER"]
+        repo        = os.environ["GITHUB_REPO"]
         workflow_id = os.environ["GITHUB_RETRAIN_WORKFLOW_ID"]
-        ref = os.getenv("GITHUB_DEFAULT_BRANCH", "main")
+        ref         = os.getenv("GITHUB_DEFAULT_BRANCH", "main")
 
         url = (
             f"https://api.github.com/repos/{owner}/{repo}"
             f"/actions/workflows/{workflow_id}/dispatches"
         )
+
         payload = {
             "ref": ref,
             "inputs": {
-                "model_id": model_id,
-                "environment": environment,
-                "reason": reason,
-                "triggered_by": triggered_by,
-                "timestamp": datetime.now(timezone.utc).isoformat(),
+                # identity
+                "model_id":              model_id,
+                "environment":           environment,
+                "severity":              severity,
+                "reason":                reason,
+                "triggered_by":          triggered_by,
+
+                # data prescription
+                "data_strategy":         prescription.get("data_strategy", "recent_window"),
+                "window_days":           str(prescription.get("window_days", 30)),
+                "drift_period_weight":   str(prescription.get("drift_period_weight", 1.5)),
+                "exclude_before":        prescription.get("exclude_before", ""),
+                "refit_preprocessors":   str(prescription.get("refit_preprocessors", True)).lower(),
+                "drifted_features":      json.dumps(prescription.get("drifted_features", [])),
+
+                # model / threshold prescription
+                "optimize_for":          prescription.get("optimize_for", "recall"),
+                "target_recall":         str(prescription.get("target_recall", 0.80)),
+                "target_roc_auc":        str(prescription.get("target_roc_auc", 0.88)),
+
+                # deployment prescription
+                "deployment_strategy":   prescription.get("deployment_strategy", "canary"),
+                "canary_traffic_pct":    str(prescription.get("canary_traffic_pct", 10)),
+                "shadow_period_hours":   str(prescription.get("shadow_period_hours", 2)),
+
+                # current degraded metrics (for the workflow log)
+                "current_metrics":       json.dumps(current_metrics),
             },
         }
+
         resp = requests.post(
             url,
             json=payload,
             headers={
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/vnd.github+json",
+                "Authorization":       f"Bearer {token}",
+                "Accept":              "application/vnd.github+json",
                 "X-GitHub-Api-Version": "2022-11-28",
             },
             timeout=15,
         )
         resp.raise_for_status()
-        logger.info("Triggered retraining workflow for %s (%s)", model_id, environment)
+
+        logger.info(
+            "Retrain dispatched for %s (%s) — strategy=%s window=%sd",
+            model_id,
+            environment,
+            prescription.get("data_strategy"),
+            prescription.get("window_days"),
+        )
+
         return {
             "status": "success",
-            "detail": f"Retraining workflow '{workflow_id}' dispatched on branch '{ref}'.",
+            "detail": (
+                f"Retrain workflow dispatched. "
+                f"strategy={prescription.get('data_strategy')} "
+                f"window={prescription.get('window_days')}d "
+                f"optimize_for={prescription.get('optimize_for')}"
+            ),
             "workflow_url": f"https://github.com/{owner}/{repo}/actions",
         }
 
@@ -94,6 +139,31 @@ def trigger_retraining_pipeline(
         logger.error("trigger_retraining_pipeline failed: %s", exc)
         return {"status": "failed", "detail": str(exc)}
 
+
+def _is_retrain_in_progress() -> bool:
+    """Check GitHub Actions for an already-running retrain workflow."""
+    try:
+        import requests
+        token       = os.environ["GITHUB_TOKEN"]
+        owner       = os.environ["GITHUB_OWNER"]
+        repo        = os.environ["GITHUB_REPO"]
+        workflow_id = os.environ["GITHUB_RETRAIN_WORKFLOW_ID"]
+
+        url  = (
+            f"https://api.github.com/repos/{owner}/{repo}"
+            f"/actions/workflows/{workflow_id}/runs"
+        )
+        resp = requests.get(
+            url,
+            headers={"Authorization": f"Bearer {token}"},
+            params={"status": "in_progress"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        return len(resp.json().get("workflow_runs", [])) > 0
+    except Exception as exc:
+        logger.warning("Could not check workflow status: %s", exc)
+        return False   # assume not in progress if check fails
 
 def rollback_deployment(
     model_id: str,
