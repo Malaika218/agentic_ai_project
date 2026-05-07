@@ -6,8 +6,9 @@ from langchain_ollama import ChatOllama
 from langchain_core.messages import HumanMessage, SystemMessage
 from state import AgentState
 from mlops_agents.rag.store import RAGStore
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, ValidationError
 from typing import Optional
+from langchain_core.runnables import RunnableRetry
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +81,13 @@ def _llm_threshold_advisor(
         temperature=0,
     ).with_structured_output(ThresholdAdjustment)
 
+    # 2. Wrap it with built-in LangChain exponential backoff retry logic
+    llm = llm.with_retry(
+        retry_exception_types=(ValidationError, Exception),  # Catches schema + network drops
+        max_attempt_number=3,                                # Total try attempts
+        wait_exponential_jitter=True                         # Applies exponential delay with jitter
+    )
+
     metrics = state.get("metrics") or {}
 
     # Prompt text remains clean since formatting rules are handled at the schema level
@@ -127,9 +135,10 @@ Recent trend:
         return response.model_dump()
         
     except Exception as exc:
-        logger.error("Threshold advisor failed: %s", exc)
+        # Triggers only if all 3 backoff attempts fail completely
+        logger.error("All threshold advisor backoff retries exhausted: %s", exc)
         return {"should_update": False, "confidence": 0.0, "reasoning": str(exc), "adjustments": {}}
-
+    
 def run_threshold_update(state: AgentState, rag: RAGStore) -> None:
     """Main entry point for the threshold learning subsystem."""
     metrics = state.get("metrics") or {}
