@@ -11,7 +11,8 @@ import requests
 import pandas as pd
 import numpy as np
 
-st.set_page_config(page_title="Drift Lab · MLOps", page_icon="⬡", layout="wide")
+st.set_page_config(page_title="Drift Lab · MLOps",
+                   page_icon="⬡", layout="wide")
 
 st.markdown("""
 <style>
@@ -33,10 +34,12 @@ html,body,[data-testid="stAppViewContainer"]{background-color:var(--bg)!importan
 </style>
 """, unsafe_allow_html=True)
 
-API          = st.session_state.get("api_url",   "http://localhost:8000")
+API = st.session_state.get("api_url",   "http://localhost:8000")
 MODEL_SERVER = st.session_state.get("model_url", "http://localhost:8080")
 
-FEATURE_NAMES = [f"V{i}" for i in range(1, 29)] + ["Amount_scaled", "Time_scaled"]
+FEATURE_NAMES = [f"V{i}" for i in range(
+    1, 29)] + ["Amount_scaled", "Time_scaled"]
+
 
 def section(title, subtitle=""):
     st.markdown(f"""
@@ -46,9 +49,11 @@ def section(title, subtitle=""):
     </div>
     """, unsafe_allow_html=True)
 
+
 def _rgb(h):
     h = h.lstrip("#")
-    return f"{int(h[0:2],16)},{int(h[2:4],16)},{int(h[4:6],16)}"
+    return f"{int(h[0:2], 16)},{int(h[2:4], 16)},{int(h[4:6], 16)}"
+
 
 # ── fetch current drift status ────────────────────────────────────────────────
 drift_status = {}
@@ -73,11 +78,11 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 active = drift_status.get("active", False)
-dtype  = drift_status.get("drift_type", "none")
+dtype = drift_status.get("drift_type", "none")
 
 if active:
-    dtype_label = dtype.replace("_"," ").upper()
-    desc = drift_status.get("description","")
+    dtype_label = dtype.replace("_", " ").upper()
+    desc = drift_status.get("description", "")
     st.markdown(f"""
     <div style="margin:8px 0 4px;padding:12px 16px;background:rgba(255,184,0,0.08);
                 border:1px solid rgba(255,184,0,0.4);border-radius:6px;
@@ -85,8 +90,8 @@ if active:
                 display:flex;align-items:center;justify-content:space-between;">
         <span>⚠ ACTIVE DRIFT: <strong>{dtype_label}</strong>{"  ·  "+desc if desc else ""}</span>
         <span style="color:#555c72;font-size:0.7rem;">
-            features: {drift_status.get('features',[])} &nbsp; magnitude: {drift_status.get('magnitude',0)}
-            &nbsp; swap: {drift_status.get('swap_features',[])}
+            features: {drift_status.get('features', [])} &nbsp; magnitude: {drift_status.get('magnitude', 0)}
+            &nbsp; swap: {drift_status.get('swap_features', [])}
         </span>
     </div>
     """, unsafe_allow_html=True)
@@ -106,9 +111,12 @@ ec1, ec2, ec3 = st.columns(3)
 for col, (dtype_key, title, desc, color) in zip(
     [ec1, ec2, ec3],
     [
-        ("data_drift",    "Data Drift",    "Input feature distributions shift. Model sees unfamiliar inputs. Accuracy degrades gradually. Uncertainty rises.", "#00d4ff"),
-        ("concept_drift", "Concept Drift", "Label relationships change. Fraud now looks like legit transactions. Model confidently wrong. Recall collapses.", "#ff4560"),
-        ("mixed",         "Mixed",         "Both simultaneously. Severe degradation across all metrics. Most realistic production failure mode.", "#ffb800"),
+        ("data_drift",    "Data Drift",
+         "Input feature distributions shift. Model sees unfamiliar inputs. Accuracy degrades gradually. Uncertainty rises.", "#00d4ff"),
+        ("concept_drift", "Concept Drift",
+         "Label relationships change. Fraud now looks like legit transactions. Model confidently wrong. Recall collapses.", "#ff4560"),
+        ("mixed",         "Mixed",
+         "Both simultaneously. Severe degradation across all metrics. Most realistic production failure mode.", "#ffb800"),
     ]
 ):
     with col:
@@ -127,7 +135,7 @@ drift_type_sel = st.radio(
     "Drift type",
     ["data_drift", "concept_drift", "mixed"],
     horizontal=True,
-    format_func=lambda x: x.replace("_"," ").title(),
+    format_func=lambda x: x.replace("_", " ").title(),
     key="drift_type_radio",
     label_visibility="collapsed",
 )
@@ -164,7 +172,7 @@ if drift_type_sel in ("data_drift", "mixed"):
         </div>
         """, unsafe_allow_html=True)
 
-    config["features"]  = selected_features
+    config["features"] = selected_features
     config["magnitude"] = magnitude
 
     # preset scenarios
@@ -175,13 +183,13 @@ if drift_type_sel in ("data_drift", "mixed"):
     ps1, ps2, ps3 = st.columns(3)
     presets = [
         ("High-value merchant shift", ["Amount_scaled"], 3.0),
-        ("Geographic shift",          ["V14","V17","V12"], 2.0),
-        ("Feature pipeline change",   ["V1","V2","V3","V4"], 1.5),
+        ("Geographic shift",          ["V14", "V17", "V12"], 2.0),
+        ("Feature pipeline change",   ["V1", "V2", "V3", "V4"], 1.5),
     ]
-    for col, (name, feats, mag) in zip([ps1,ps2,ps3], presets):
+    for col, (name, feats, mag) in zip([ps1, ps2, ps3], presets):
         with col:
             if st.button(name, key=f"preset_{name}", use_container_width=True):
-                st.session_state["drift_features"]  = feats
+                st.session_state["drift_features"] = feats
                 st.session_state["drift_magnitude"] = mag
                 st.rerun()
 
@@ -246,7 +254,7 @@ with btn1:
             r = requests.post(f"{API}/drift/inject", json=config, timeout=8)
             r.raise_for_status()
             resp = r.json()
-            st.success(resp.get("message","Drift injected"))
+            st.success(resp.get("message", "Drift injected"))
             time.sleep(0.5)
             st.rerun()
         except Exception as e:
@@ -268,13 +276,15 @@ with btn3:
         try:
             r = requests.post(
                 f"{API}/runs",
-                json={"model_id": "fraud-classifier-v1", "environment": "production"},
+                json={"model_id": "fraud-classifier-v1",
+                      "environment": "production"},
                 timeout=8,
             )
             r.raise_for_status()
             tid = r.json()["thread_id"]
             st.session_state["active_thread_id"] = tid
-            st.info(f"Monitor cycle started — thread {tid[:16]}… · Check Overview page")
+            st.info(
+                f"Monitor cycle started — thread {tid[:16]}… · Check Overview page")
         except Exception as e:
             st.error(f"Failed: {e}")
 
@@ -292,12 +302,13 @@ try:
 
     lc1, lc2, lc3, lc4 = st.columns(4)
     cards = [
-        ("Drift Score",    m.get("drift_score",0),   "#ff4560",   "f{:.4f}"),
-        ("Accuracy Proxy", m.get("accuracy",0),       "#00d4ff",   "f{:.4f}"),
-        ("Latency p95",    m.get("latency_ms",0),     "#00e5a0",   "f{:.1f}ms"),
-        ("Error Rate",     m.get("error_rate",0),     "#ffb800",   "f{:.4f}"),
+        ("Drift Score",    m.get("drift_score", 0),   "#ff4560",   "f{:.4f}"),
+        ("Accuracy Proxy", m.get("accuracy", 0),       "#00d4ff",   "f{:.4f}"),
+        ("Latency p95",    m.get("latency_ms", 0),
+         "#00e5a0",   "f{:.1f}ms"),
+        ("Error Rate",     m.get("error_rate", 0),     "#ffb800",   "f{:.4f}"),
     ]
-    for col, (label, val, color, fmt) in zip([lc1,lc2,lc3,lc4], cards):
+    for col, (label, val, color, fmt) in zip([lc1, lc2, lc3, lc4], cards):
         display = f"{val:.4f}" if "ms" not in fmt else f"{val:.1f}ms"
         with col:
             st.markdown(f"""
@@ -311,9 +322,9 @@ try:
 
     st.markdown(f"""
     <div style="margin-top:10px;font-family:'JetBrains Mono',monospace;font-size:0.7rem;color:#555c72;">
-        sample_size: {m.get('sample_size',0)} predictions &nbsp;·&nbsp;
-        fraud_rate: {m.get('fraud_rate',0):.4f} &nbsp;·&nbsp;
-        drift_type: {m.get('drift_type','none')}
+        sample_size: {m.get('sample_size', 0)} predictions &nbsp;·&nbsp;
+        fraud_rate: {m.get('fraud_rate', 0):.4f} &nbsp;·&nbsp;
+        drift_type: {m.get('drift_type', 'none')}
     </div>
     """, unsafe_allow_html=True)
 
@@ -338,11 +349,12 @@ try:
     else:
         df_p = pd.DataFrame(preds)
         probs = df_p["fraud_prob"].values
-        hist, edges = np.histogram(probs, bins=20, range=(0,1))
-        bin_labels  = [f"{e:.2f}" for e in edges[:-1]]
-        hist_df     = pd.DataFrame({"bin": bin_labels, "count": hist}).set_index("bin")
+        hist, edges = np.histogram(probs, bins=20, range=(0, 1))
+        bin_labels = [f"{e:.2f}" for e in edges[:-1]]
+        hist_df = pd.DataFrame(
+            {"bin": bin_labels, "count": hist}).set_index("bin")
 
-        hcol1, hcol2 = st.columns([3,1])
+        hcol1, hcol2 = st.columns([3, 1])
         with hcol1:
             color = "#ff4560" if active else "#00d4ff"
             st.bar_chart(hist_df, color=color, height=180)
@@ -359,8 +371,9 @@ try:
                         unsafe_allow_html=True)
 
         with hcol2:
-            avg_conf = float(df_p["fraud_prob"].apply(lambda p: max(p,1-p)).mean())
-            fraud_n  = int(df_p["prediction"].sum())
+            avg_conf = float(df_p["fraud_prob"].apply(
+                lambda p: max(p, 1-p)).mean())
+            fraud_n = int(df_p["prediction"].sum())
             st.markdown(f"""
             <div style="background:#111318;border:1px solid #1f2330;border-radius:8px;padding:14px;">
                 <div style="font-size:0.62rem;color:#555c72;letter-spacing:0.12em;margin-bottom:10px;">STATS</div>
@@ -417,13 +430,14 @@ for agent, behaviour in rows:
 
 # ── auto refresh ──────────────────────────────────────────────────────────────
 st.markdown("<div style='height:16px'></div>", unsafe_allow_html=True)
-rc1, rc2 = st.columns([1,5])
+rc1, rc2 = st.columns([1, 5])
 with rc1:
     if st.button("↺  Refresh", use_container_width=True):
         st.rerun()
 with rc2:
     if active:
-        auto = st.toggle("Auto-refresh every 5s", value=False, key="drift_auto_refresh")
+        auto = st.toggle("Auto-refresh every 5s", value=False,
+                         key="drift_auto_refresh")
         if auto:
             time.sleep(5)
             st.rerun()
