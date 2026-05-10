@@ -242,6 +242,95 @@ else:
                 </div>
             </div>""", unsafe_allow_html=True)
 
+        # agent message trace
+        if run.get("messages"):
+            section("Agent Trace")
+            for msg in run["messages"]:
+                # messages are prefixed [Monitor], [Diagnosis], [Remediation], [Reporting]
+                agent_tag = msg.split("]")[0].lstrip("[") if "]" in msg else "Agent"
+                content   = msg.split("]", 1)[1].strip() if "]" in msg else msg
+                tag_color = {
+                    "Monitor":     "#00d4ff",
+                    "Diagnosis":   "#9b59ff",
+                    "Remediation": "#ffb800",
+                    "Reporting":   "#00e5a0",
+                }.get(agent_tag, "#555c72")
+
+                st.markdown(f"""
+                <div style="display:flex;gap:12px;padding:8px 12px;border-bottom:1px solid #13161e;
+                            font-family:'JetBrains Mono',monospace;font-size:0.76rem;">
+                    <div style="min-width:100px;color:{tag_color};font-weight:600;">[{agent_tag}]</div>
+                    <div style="color:#8b91a8;line-height:1.6;">{content}</div>
+                </div>
+                """, unsafe_allow_html=True)
+
+        # remediation detail
+        if run.get("remediation_detail"):
+            st.markdown(f"""
+            <div style="margin-top:12px;padding:12px 16px;background:#111318;
+                        border:1px solid #1f2330;border-radius:6px;">
+                <span style="font-size:0.65rem;color:#555c72;letter-spacing:0.12em;">REMEDIATION DETAIL</span>
+                <div style="font-size:0.82rem;color:#8b91a8;margin-top:6px;line-height:1.6;">
+                    {run['remediation_detail']}
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        # retrain prescription
+        if run.get("retrain_prescription"):
+            p = run["retrain_prescription"]
+            section("Retrain Prescription")
+            pc1, pc2, pc3 = st.columns(3)
+            with pc1:
+                st.markdown(f"""
+                <div style="background:#111318;border:1px solid #1f2330;border-radius:8px;padding:16px;">
+                    <div style="font-size:0.62rem;color:#555c72;letter-spacing:0.12em;margin-bottom:10px;">DATA</div>
+                    <table style="width:100%;font-size:0.76rem;border-collapse:collapse;">
+                        <tr><td style="color:#555c72;padding:4px 0;">strategy</td>
+                            <td style="color:#00d4ff;text-align:right;">{p.get('data_strategy','—')}</td></tr>
+                        <tr><td style="color:#555c72;padding:4px 0;">window_days</td>
+                            <td style="color:#e8eaf0;text-align:right;">{p.get('window_days','—')}</td></tr>
+                        <tr><td style="color:#555c72;padding:4px 0;">drift_weight</td>
+                            <td style="color:#e8eaf0;text-align:right;">{p.get('drift_period_weight','—')}</td></tr>
+                        <tr><td style="color:#555c72;padding:4px 0;">exclude_before</td>
+                            <td style="color:#e8eaf0;text-align:right;">{p.get('exclude_before','—') or 'none'}</td></tr>
+                    </table>
+                </div>
+                """, unsafe_allow_html=True)
+            with pc2:
+                st.markdown(f"""
+                <div style="background:#111318;border:1px solid #1f2330;border-radius:8px;padding:16px;">
+                    <div style="font-size:0.62rem;color:#555c72;letter-spacing:0.12em;margin-bottom:10px;">MODEL</div>
+                    <table style="width:100%;font-size:0.76rem;border-collapse:collapse;">
+                        <tr><td style="color:#555c72;padding:4px 0;">optimize_for</td>
+                            <td style="color:#9b59ff;text-align:right;">{p.get('optimize_for','—')}</td></tr>
+                        <tr><td style="color:#555c72;padding:4px 0;">target_recall</td>
+                            <td style="color:#e8eaf0;text-align:right;">{p.get('target_recall','—')}</td></tr>
+                        <tr><td style="color:#555c72;padding:4px 0;">target_roc_auc</td>
+                            <td style="color:#e8eaf0;text-align:right;">{p.get('target_roc_auc','—')}</td></tr>
+                        <tr><td style="color:#555c72;padding:4px 0;">drifted_features</td>
+                            <td style="color:#ff4560;text-align:right;font-size:0.68rem;">
+                                {', '.join(p.get('drifted_features',[]) or ['—'])}</td></tr>
+                    </table>
+                </div>
+                """, unsafe_allow_html=True)
+            with pc3:
+                st.markdown(f"""
+                <div style="background:#111318;border:1px solid #1f2330;border-radius:8px;padding:16px;">
+                    <div style="font-size:0.62rem;color:#555c72;letter-spacing:0.12em;margin-bottom:10px;">DEPLOYMENT</div>
+                    <table style="width:100%;font-size:0.76rem;border-collapse:collapse;">
+                        <tr><td style="color:#555c72;padding:4px 0;">strategy</td>
+                            <td style="color:#00e5a0;text-align:right;">{p.get('deployment_strategy','—')}</td></tr>
+                        <tr><td style="color:#555c72;padding:4px 0;">canary_pct</td>
+                            <td style="color:#e8eaf0;text-align:right;">{p.get('canary_traffic_pct','—')}%</td></tr>
+                        <tr><td style="color:#555c72;padding:4px 0;">shadow_hours</td>
+                            <td style="color:#e8eaf0;text-align:right;">{p.get('shadow_period_hours','—')}h</td></tr>
+                        <tr><td style="color:#555c72;padding:4px 0;">refit_preproc</td>
+                            <td style="color:#e8eaf0;text-align:right;">{p.get('refit_preprocessors','—')}</td></tr>
+                    </table>
+                </div>
+                """, unsafe_allow_html=True)
+
         if run.get("diagnosis"):
             st.markdown(f"""
             <div style="margin-top:12px;padding:12px 16px;background:#111318;

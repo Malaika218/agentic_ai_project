@@ -124,6 +124,89 @@ else:
         </div>
         """, unsafe_allow_html=True)
 
+        # evidence list
+        diag_json = run.get("diagnosis_json", {}) or {}
+        evidence  = diag_json.get("evidence", [])
+        reasoning = diag_json.get("reasoning", "")
+        confidence = diag_json.get("confidence")
+        root_cat   = diag_json.get("root_cause_category", "")
+
+        if evidence:
+            st.markdown(f"""
+            <div style="background:#0d0f14;border:1px solid #1f2330;border-radius:6px;
+                        padding:14px 16px;margin-bottom:12px;">
+                <div style="font-size:0.62rem;color:#555c72;letter-spacing:0.12em;margin-bottom:8px;">
+                    EVIDENCE
+                    {"<span style='float:right;color:#9b59ff;'>confidence: "+str(confidence)+"</span>" if confidence else ""}
+                    {"<span style='margin-left:8px;color:#00d4ff;font-size:0.65rem;'>"+root_cat+"</span>" if root_cat else ""}
+                </div>
+                {"".join(f'<div style="font-size:0.78rem;color:#8b91a8;padding:3px 0;line-height:1.6;">· {e}</div>' for e in evidence)}
+            </div>
+            """, unsafe_allow_html=True)
+
+        if reasoning:
+            st.markdown(f"""
+            <div style="background:#0d0f14;border:1px solid #1f2330;border-radius:6px;
+                        padding:14px 16px;margin-bottom:12px;">
+                <div style="font-size:0.62rem;color:#555c72;letter-spacing:0.12em;margin-bottom:8px;">REASONING CHAIN</div>
+                <div style="font-size:0.82rem;color:#8b91a8;line-height:1.7;">{reasoning}</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        # prescription summary
+        prescription = run.get("retrain_prescription")
+        if prescription:
+            st.markdown(f"""
+            <div style="background:#0d0f14;border:1px solid rgba(0,212,255,0.2);border-radius:6px;
+                        padding:14px 16px;margin-bottom:12px;">
+                <div style="font-size:0.62rem;color:#555c72;letter-spacing:0.12em;margin-bottom:8px;">PROPOSED PRESCRIPTION</div>
+                <div style="display:flex;flex-wrap:wrap;gap:8px;font-size:0.75rem;">
+                    <span style="background:#1a1d26;color:#00d4ff;padding:4px 10px;border-radius:3px;">
+                        strategy: {prescription.get('data_strategy','—')}
+                    </span>
+                    <span style="background:#1a1d26;color:#e8eaf0;padding:4px 10px;border-radius:3px;">
+                        window: {prescription.get('window_days','—')}d
+                    </span>
+                    <span style="background:#1a1d26;color:#9b59ff;padding:4px 10px;border-radius:3px;">
+                        optimize: {prescription.get('optimize_for','—')}
+                    </span>
+                    <span style="background:#1a1d26;color:#00e5a0;padding:4px 10px;border-radius:3px;">
+                        deploy: {prescription.get('deployment_strategy','—')}
+                    </span>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+        # RAG context used
+        similar = run.get("similar_incidents", []) or []
+        runbooks = run.get("relevant_runbooks", []) or []
+        if similar or runbooks:
+            st.markdown(f"""
+            <div style="font-size:0.72rem;color:#555c72;padding:8px 0;">
+                RAG context used: {len(similar)} similar incidents · {len(runbooks)} runbooks
+                {"· top match: "+str(round(1-similar[0].get('distance',1),3))+" similarity" if similar else ""}
+            </div>
+            """, unsafe_allow_html=True)
+
+        # agent trace
+        messages = run.get("messages", []) or []
+        if messages:
+            with st.expander("Agent message trace", expanded=False):
+                for msg in messages:
+                    agent_tag = msg.split("]")[0].lstrip("[") if "]" in msg else "Agent"
+                    content   = msg.split("]", 1)[1].strip() if "]" in msg else msg
+                    tag_color = {
+                        "Monitor": "#00d4ff", "Diagnosis": "#9b59ff",
+                        "Remediation": "#ffb800", "Reporting": "#00e5a0",
+                    }.get(agent_tag, "#555c72")
+                    st.markdown(f"""
+                    <div style="display:flex;gap:12px;padding:6px 0;border-bottom:1px solid #13161e;
+                                font-family:'JetBrains Mono',monospace;font-size:0.73rem;">
+                        <div style="min-width:90px;color:{tag_color};">[{agent_tag}]</div>
+                        <div style="color:#8b91a8;">{content}</div>
+                    </div>
+                    """, unsafe_allow_html=True)
+
         # approve / reject buttons
         btn_c1, btn_c2, btn_c3 = st.columns([1, 1, 4])
         with btn_c1:
