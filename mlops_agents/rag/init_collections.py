@@ -623,10 +623,15 @@ Recall dropped because the fraud boundary shifted with the Amount distribution.
     print("Connecting to ChromaDB...")
     rag = RAGStore()
 
+    if rag._runbooks.count() > 0:
+        print(f"Runbooks collection already has {rag._runbooks.count()} documents.")
+        print("Skipping seeding to avoid duplicates.")
+        return
+    
     for doc in RUNBOOKS:
         doc_id = rag.ingest_runbook(doc)
-        print(f"  ✓ {rb['title'][:60]}")
-        print(f"    type={rb['doc_type']} tags={rb['tags'][:50]}")
+        print(f"  ✓ {doc['title'][:60]}")
+        print(f"    type={doc['doc_type']} tags={doc['tags'][:50]}")
         print(f"    id={doc_id[:32]}…\n")
 
     total = rag._runbooks.count()

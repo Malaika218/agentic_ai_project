@@ -424,6 +424,7 @@ class RAGStore:
             doc_id
         """
         doc_id = doc.get("doc_id") or str(uuid.uuid4())
+        doc_id = str(doc_id)  # ensure it's a string for ChromaDB
         now = self._now_iso()
 
         metadata = self._flatten_meta(

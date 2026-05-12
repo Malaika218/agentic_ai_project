@@ -27,6 +27,7 @@ Endpoints:
 
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 import logging
 import os
 import uuid
@@ -50,10 +51,19 @@ logger = logging.getLogger("api")
 MODEL_SERVER_URL = os.getenv("FRAUD_MODEL_MCP_URL", "http://localhost:8080")
 OLLAMA_URL       = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    from mlops_agents.rag.init_collections import init
+    # This runs EVERY time the server starts or reloads
+    init()
+    yield
+    # Clean up code here if needed
+
 app = FastAPI(
     title="MLOps Agent API",
     description="HTTP wrapper around the LangGraph MLOps pipeline",
     version="1.0.0",
+    lifespan=lifespan
 )
 
 # ── in-memory run registry ────────────────────────────────────────────────────
@@ -437,12 +447,7 @@ async def health():
 # ── entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    
-    from mlops_agents.rag.init_collections import init
     import uvicorn
-    
-    # run initialization script for RAG
-    init()
     
     uvicorn.run(
         "api.main:app",
