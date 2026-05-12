@@ -6,3 +6,5 @@ venv/**
 **/*.db
 .vscode/**
 local_dev/**
+*.egg-info/**
+rag_data/**
