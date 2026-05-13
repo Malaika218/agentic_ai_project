@@ -37,7 +37,8 @@ from dotenv import load_dotenv
 load_dotenv()
 
 MODEL_SERVER = os.getenv("FRAUD_MODEL_MCP_URL", "http://localhost:8080")
-DATA_PATH    = Path(os.getenv("DATA_PATH", "./data/creditcard.csv"))
+PARENT_DIR     = Path(__file__).parent.parent
+DATA_PATH    = PARENT_DIR / "data" / "creditcard.csv"
 
 
 def load_test_rows(data_path: Path, n: int = 500) -> list[dict]:
@@ -193,6 +194,8 @@ def run(
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def main():
+    global MODEL_SERVER
+    
     parser = argparse.ArgumentParser(
         description="Replay Kaggle creditcard rows against the fraud model server"
     )
@@ -215,7 +218,6 @@ def main():
 
     args = parser.parse_args()
 
-    global MODEL_SERVER
     MODEL_SERVER = args.server
 
     run(
