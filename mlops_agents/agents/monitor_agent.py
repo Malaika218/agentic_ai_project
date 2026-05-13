@@ -22,7 +22,7 @@ from pydantic import BaseModel, Field, field_validator, ValidationError
 
 from state import AgentState
 from mlops_agents.rag.store import RAGStore
-from tools.metrics_source import fetch_model_metrics, MetricsSourceError
+from mlops_agents.tools.metrics_source import fetch_model_metrics, MetricsSourceError
 
 logger = logging.getLogger(__name__)
 

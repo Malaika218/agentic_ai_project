@@ -18,8 +18,8 @@ from langchain_core.messages import HumanMessage, SystemMessage
 
 from state import AgentState
 from mlops_agents.rag.store import RAGStore
-from tools.mcp_tools import send_slack_notification, send_email_alert
-from agents.threshold_manager import run_threshold_update
+from mlops_agents.tools.mcp_tools import send_slack_notification, send_email_alert
+from mlops_agents.agents.threshold_manager import run_threshold_update
 
 logger = logging.getLogger(__name__)
 

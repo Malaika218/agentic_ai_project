@@ -15,7 +15,7 @@ import os
 from langchain_core.messages import HumanMessage
 
 from state import AgentState
-from tools.mcp_tools import (
+from mlops_agents.tools.mcp_tools import (
     trigger_retraining_pipeline,
     rollback_deployment,
     scale_deployment,
