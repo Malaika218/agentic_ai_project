@@ -33,5 +33,3 @@ pandas
 
 # for streamlit dashboards
 streamlit
-
-redis
