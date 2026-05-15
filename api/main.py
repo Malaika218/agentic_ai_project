@@ -5,9 +5,6 @@ FastAPI backend — wraps the LangGraph CLI pipeline with HTTP endpoints
 so the Streamlit dashboard can trigger runs, poll status, and handle
 human-in-the-loop approvals without touching the terminal.
 
-This is a new file. It sits alongside the existing CLI (main.py) and
-shares the same underlying graph/workflow.py and agent code.
-
 Run with:
     uvicorn api.main:app --host 0.0.0.0 --port 8000 --reload
 
@@ -20,18 +17,24 @@ Endpoints:
     GET  /metrics/current           latest metrics snapshot from model server
     GET  /incidents                 ChromaDB incident history
     GET  /health                    Ollama + ChromaDB + model server reachability
-    POST /drift/inject              forward drift config to model server
-    POST /drift/reset               clear active drift on model server
-    GET  /drift/status              current drift config from model server
+    POST /datasets/create           run dataset_generator.py for all scenarios
+    GET  /datasets                  list available datasets on disk
+    POST /generator/start           start transaction generator on a named dataset
+    POST /generator/stop            stop the generator subprocess
+    GET  /generator/status          is generator running, which dataset, how many sent
 """
 
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+import json
 import logging
 import os
+import subprocess
+import sys
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import requests as http
@@ -50,26 +53,34 @@ logger = logging.getLogger("api")
 # ── config ────────────────────────────────────────────────────────────────────
 MODEL_SERVER_URL = os.getenv("FRAUD_MODEL_MCP_URL", "http://localhost:8080")
 OLLAMA_URL       = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+PROJECT_ROOT     = Path(__file__).parent.parent
+DATASETS_DIR     = PROJECT_ROOT / "data" / "datasets"
+ACTIVE_DATASET_FILE = PROJECT_ROOT / "data" / "active_dataset.json"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     from mlops_agents.rag.init_collections import init
-    # This runs EVERY time the server starts or reloads
     init()
     yield
-    # Clean up code here if needed
 
 app = FastAPI(
     title="MLOps Agent API",
     description="HTTP wrapper around the LangGraph MLOps pipeline",
     version="1.0.0",
-    lifespan=lifespan
+    lifespan=lifespan,
 )
 
 # ── in-memory run registry ────────────────────────────────────────────────────
-# Maps thread_id → run state dict.
-# In production this would be Redis or a DB. For local dev, in-memory is fine.
 runs: dict[str, dict[str, Any]] = {}
+
+# ── in-memory generator state ─────────────────────────────────────────────────
+_generator_proc: subprocess.Popen | None = None
+_generator_state: dict[str, Any] = {
+    "running":  False,
+    "dataset":  None,
+    "pid":      None,
+    "started_at": None,
+}
 
 # ── pydantic models ───────────────────────────────────────────────────────────
 
@@ -77,19 +88,16 @@ class RunRequest(BaseModel):
     model_id:    str = os.getenv("DEFAULT_MODEL_ID", "fraud-classifier-v1")
     environment: str = "production"
 
-class DriftInjectRequest(BaseModel):
-    type: str
-    features: list[str] = []
-    mean_shift: float = 1.5
-    noise_scale: float = 0.3
-    corruption_rate: float = 0.3
-    fraud_features: list[str] = ["V14", "V4", "V11", "V12"]
-    description: str = ""
+
+class GeneratorStartRequest(BaseModel):
+    dataset: str = "baseline"
+    rate:    float = 2.0
+    error_rate: float = 0.0
+    seed_n:  int = 500
 
 # ── pipeline execution helpers ────────────────────────────────────────────────
 
 def _build_graph():
-    """Import and build the LangGraph app. Isolated here so imports are lazy."""
     from mlops_agents.rag.store import RAGStore
     from mlops_agents.graph.workflow import build_graph
     rag = RAGStore()
@@ -97,12 +105,8 @@ def _build_graph():
 
 
 async def _execute_pipeline(thread_id: str, model_id: str, environment: str):
-    """
-    Background task — runs the full pipeline and updates the runs registry.
-    Catches GraphInterrupt to surface the human approval pause.
-    """
-    runs[thread_id]["status"]       = "running"
-    runs[thread_id]["started_at"]   = datetime.now(timezone.utc).isoformat()
+    runs[thread_id]["status"]        = "running"
+    runs[thread_id]["started_at"]    = datetime.now(timezone.utc).isoformat()
     runs[thread_id]["current_agent"] = "monitor"
 
     try:
@@ -115,41 +119,21 @@ async def _execute_pipeline(thread_id: str, model_id: str, environment: str):
             "messages":    [],
         }
 
-        # stream events so we can update current_agent in real time
         for event in app_graph.stream(initial_state, config=config):
             node_name = list(event.keys())[0]
             node_out  = event[node_name] or {}
 
             runs[thread_id]["current_agent"] = node_name
 
-            if "severity" in node_out:
-                runs[thread_id]["severity"] = node_out["severity"]
-            if "diagnosis" in node_out:
-                runs[thread_id]["diagnosis"] = node_out["diagnosis"]
-            if "recommended_action" in node_out:
-                runs[thread_id]["recommended_action"] = node_out["recommended_action"]
-            if "remediation_status" in node_out:
-                runs[thread_id]["remediation_status"] = node_out["remediation_status"]
-            if "incident_id" in node_out:
-                runs[thread_id]["incident_id"] = node_out["incident_id"]
-            if "report" in node_out:
-                runs[thread_id]["report"] = node_out["report"]
-            if "remediation_action" in node_out:
-                runs[thread_id]["remediation_action"] = node_out["remediation_action"]
-            if "remediation_detail" in node_out:
-                runs[thread_id]["remediation_detail"] = node_out["remediation_detail"]
-            if "diagnosis_json" in node_out:
-                runs[thread_id]["diagnosis_json"] = node_out["diagnosis_json"]
-            if "retrain_prescription" in node_out:
-                runs[thread_id]["retrain_prescription"] = node_out["retrain_prescription"]
-            if "drifted_features" in node_out:
-                runs[thread_id]["drifted_features"] = node_out["drifted_features"]
-            if "similar_incidents" in node_out:
-                runs[thread_id]["similar_incidents"] = node_out["similar_incidents"]
-            if "relevant_runbooks" in node_out:
-                runs[thread_id]["relevant_runbooks"] = node_out["relevant_runbooks"]
-            if "notifications_sent" in node_out:
-                runs[thread_id]["notifications_sent"] = node_out["notifications_sent"]
+            for field in [
+                "severity", "diagnosis", "recommended_action", "remediation_status",
+                "incident_id", "report", "remediation_action", "remediation_detail",
+                "diagnosis_json", "retrain_prescription", "drifted_features",
+                "similar_incidents", "relevant_runbooks", "notifications_sent",
+            ]:
+                if field in node_out:
+                    runs[thread_id][field] = node_out[field]
+
             if "messages" in node_out:
                 runs[thread_id]["messages"] = [
                     m.content if hasattr(m, "content") else str(m)
@@ -171,8 +155,7 @@ async def _execute_pipeline(thread_id: str, model_id: str, environment: str):
 
 
 async def _resume_pipeline(thread_id: str, approved: bool):
-    """Background task — resumes a paused pipeline after human decision."""
-    runs[thread_id]["status"]       = "running"
+    runs[thread_id]["status"]        = "running"
     runs[thread_id]["current_agent"] = "remediation"
 
     try:
@@ -185,36 +168,23 @@ async def _resume_pipeline(thread_id: str, approved: bool):
             node_out  = event[node_name] or {}
             runs[thread_id]["current_agent"] = node_name
 
-            if "remediation_status" in node_out:
-                runs[thread_id]["remediation_status"] = node_out["remediation_status"]
-            if "incident_id" in node_out:
-                runs[thread_id]["incident_id"] = node_out["incident_id"]
-            if "report" in node_out:
-                runs[thread_id]["report"] = node_out["report"]
-            if "remediation_action" in node_out:
-                runs[thread_id]["remediation_action"] = node_out["remediation_action"]
-            if "remediation_detail" in node_out:
-                runs[thread_id]["remediation_detail"] = node_out["remediation_detail"]
-            if "diagnosis_json" in node_out:
-                runs[thread_id]["diagnosis_json"] = node_out["diagnosis_json"]
-            if "retrain_prescription" in node_out:
-                runs[thread_id]["retrain_prescription"] = node_out["retrain_prescription"]
-            if "drifted_features" in node_out:
-                runs[thread_id]["drifted_features"] = node_out["drifted_features"]
-            if "similar_incidents" in node_out:
-                runs[thread_id]["similar_incidents"] = node_out["similar_incidents"]
-            if "relevant_runbooks" in node_out:
-                runs[thread_id]["relevant_runbooks"] = node_out["relevant_runbooks"]
-            if "notifications_sent" in node_out:
-                runs[thread_id]["notifications_sent"] = node_out["notifications_sent"]
+            for field in [
+                "remediation_status", "incident_id", "report", "remediation_action",
+                "remediation_detail", "diagnosis_json", "retrain_prescription",
+                "drifted_features", "similar_incidents", "relevant_runbooks",
+                "notifications_sent",
+            ]:
+                if field in node_out:
+                    runs[thread_id][field] = node_out[field]
+
             if "messages" in node_out:
                 runs[thread_id]["messages"] = [
                     m.content if hasattr(m, "content") else str(m)
                     for m in node_out["messages"]
                 ]
 
-        runs[thread_id]["status"]       = "completed"
-        runs[thread_id]["completed_at"] = datetime.now(timezone.utc).isoformat()
+        runs[thread_id]["status"]         = "completed"
+        runs[thread_id]["completed_at"]   = datetime.now(timezone.utc).isoformat()
         runs[thread_id]["human_approved"] = approved
 
     except Exception as exc:
@@ -230,22 +200,22 @@ async def trigger_run(req: RunRequest, background_tasks: BackgroundTasks):
     thread_id = str(uuid.uuid4())
 
     runs[thread_id] = {
-        "thread_id":           thread_id,
-        "model_id":            req.model_id,
-        "environment":         req.environment,
-        "status":              "queued",
-        "severity":            None,
-        "current_agent":       None,
-        "diagnosis":           None,
-        "recommended_action":  None,
-        "remediation_status":  None,
-        "incident_id":         None,
-        "report":              None,
-        "human_approved":      None,
-        "error":               None,
-        "created_at":          datetime.now(timezone.utc).isoformat(),
-        "started_at":          None,
-        "completed_at":        None,
+        "thread_id":            thread_id,
+        "model_id":             req.model_id,
+        "environment":          req.environment,
+        "status":               "queued",
+        "severity":             None,
+        "current_agent":        None,
+        "diagnosis":            None,
+        "recommended_action":   None,
+        "remediation_status":   None,
+        "incident_id":          None,
+        "report":               None,
+        "human_approved":       None,
+        "error":                None,
+        "created_at":           datetime.now(timezone.utc).isoformat(),
+        "started_at":           None,
+        "completed_at":         None,
         "remediation_action":   None,
         "remediation_detail":   None,
         "diagnosis_json":       None,
@@ -312,10 +282,7 @@ async def reject_run(thread_id: str, background_tasks: BackgroundTasks):
 
 @app.get("/metrics/current")
 async def current_metrics(model_id: str = None):
-    """
-    Fetch live metrics from the model server via MCP.
-    The model server logs a snapshot to MLflow tagged run_type=metrics_snapshot.
-    """
+    """Fetch live metrics from the model server via MCP."""
     try:
         r = http.post(
             f"{MODEL_SERVER_URL}/mcp/call",
@@ -331,16 +298,12 @@ async def current_metrics(model_id: str = None):
 
 @app.get("/incidents")
 async def list_incidents(limit: int = 50, severity: str = None):
-    """
-    Query ChromaDB for recent incidents.
-    Optionally filter by severity: none | minor | major | critical
-    """
+    """Query ChromaDB for recent incidents."""
     try:
         from mlops_agents.rag.store import RAGStore
-        rag    = RAGStore()
-        where  = {"severity": severity} if severity else None
+        rag   = RAGStore()
+        where = {"severity": severity} if severity else None
 
-        # use get() with a limit rather than a semantic query
         results = rag._incidents.get(
             where=where,
             include=["metadatas"],
@@ -352,62 +315,198 @@ async def list_incidents(limit: int = 50, severity: str = None):
     except Exception as e:
         raise HTTPException(500, f"ChromaDB query failed: {e}")
 
-# ── drift endpoints ───────────────────────────────────────────────────────────
+# ── dataset endpoints ─────────────────────────────────────────────────────────
 
-@app.post("/drift/inject")
-async def inject_drift(req: DriftInjectRequest):
-    """Forward a structured drift config to the model server."""
+@app.post("/datasets/create", status_code=202)
+async def create_datasets(background_tasks: BackgroundTasks):
+    """
+    Run dataset_generator.py to create all scenario CSVs in data/datasets/.
+    This is a one-time setup step.
+    """
+    script_path = PROJECT_ROOT / "scripts" / "dataset_generator.py"
+    if not script_path.exists():
+        raise HTTPException(404, f"dataset_generator.py not found at {script_path}")
+
+    def _run_generator():
+        try:
+            result = subprocess.run(
+                [sys.executable, str(script_path)],
+                cwd=str(PROJECT_ROOT),
+                capture_output=True,
+                text=True,
+                env={**os.environ, "PYTHONPATH": str(PROJECT_ROOT)},
+            )
+            if result.returncode != 0:
+                logger.error("dataset_generator.py failed:\n%s", result.stderr)
+            else:
+                logger.info("dataset_generator.py completed successfully")
+        except Exception as exc:
+            logger.error("Failed to run dataset_generator.py: %s", exc)
+
+    background_tasks.add_task(_run_generator)
+    return {"status": "started", "message": "Dataset generation running in background"}
+
+
+@app.get("/datasets")
+async def list_datasets():
+    """List available datasets on disk with their metadata."""
+    if not DATASETS_DIR.exists():
+        return []
+
+    datasets = []
+    for csv_path in sorted(DATASETS_DIR.glob("*.csv")):
+        meta_path = csv_path.with_suffix(".json")
+        entry: dict[str, Any] = {"name": csv_path.stem, "csv": csv_path.name}
+
+        if meta_path.exists():
+            try:
+                with open(meta_path) as f:
+                    entry.update(json.load(f))
+            except Exception:
+                pass
+        else:
+            # fallback: just report row count
+            try:
+                import pandas as pd
+                df = pd.read_csv(csv_path, usecols=["Class"])
+                entry["rows"] = len(df)
+                entry["fraud_rate"] = float(df["Class"].mean())
+            except Exception:
+                entry["rows"] = None
+
+        # mark which dataset is active
+        active_name = _read_active_dataset()
+        entry["active"] = (csv_path.stem == active_name)
+        datasets.append(entry)
+
+    return datasets
+
+# ── generator endpoints ───────────────────────────────────────────────────────
+
+def _read_active_dataset() -> str | None:
+    """Read the currently active dataset name from the shared state file."""
     try:
-        r = http.post(
-            f"{MODEL_SERVER_URL}/mcp/call",
-            json={
-                "tool": "inject_drift",
-                "params": {
-                    "type":            req.type,
-                    "features":        req.features,
-                    "mean_shift":      req.mean_shift,
-                    "noise_scale":     req.noise_scale,
-                    "corruption_rate": req.corruption_rate,
-                    "fraud_features":  req.fraud_features,
-                    "description":     req.description,
-                },
-            },
-            timeout=10,
-        )
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        raise HTTPException(502, f"Drift injection failed: {e}")
+        if ACTIVE_DATASET_FILE.exists():
+            with open(ACTIVE_DATASET_FILE) as f:
+                return json.load(f).get("dataset")
+    except Exception:
+        pass
+    return None
 
 
-@app.post("/drift/reset")
-async def reset_drift():
-    """Clear all active drift on the model server."""
+def _write_active_dataset(name: str) -> None:
+    """Write the active dataset name to the shared state file."""
+    ACTIVE_DATASET_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with open(ACTIVE_DATASET_FILE, "w") as f:
+        json.dump({"dataset": name, "updated_at": datetime.now(timezone.utc).isoformat()}, f)
+
+
+def _proc_alive(proc: subprocess.Popen | None) -> bool:
+    return proc is not None and proc.poll() is None
+
+
+@app.post("/generator/start", status_code=202)
+async def start_generator(req: GeneratorStartRequest):
+    """
+    Start the transaction generator subprocess replaying rows from a named dataset.
+    Writes the dataset name to data/active_dataset.json so the generator and Drift Lab
+    stay in sync.
+    """
+    global _generator_proc, _generator_state
+
+    if _proc_alive(_generator_proc):
+        raise HTTPException(409, "Generator is already running. Stop it first.")
+
+    dataset_csv = DATASETS_DIR / f"{req.dataset}.csv"
+    if not dataset_csv.exists():
+        raise HTTPException(404, f"Dataset not found: {dataset_csv}. Run POST /datasets/create first.")
+
+    script_path = PROJECT_ROOT / "scripts" / "transaction_generator.py"
+    if not script_path.exists():
+        raise HTTPException(404, f"transaction_generator.py not found at {script_path}")
+
+    # Write active dataset so generator and UI are in sync
+    _write_active_dataset(req.dataset)
+
+    cmd = [
+        sys.executable, str(script_path),
+        "--dataset",    req.dataset,
+        "--rate",       str(req.rate),
+        "--error-rate", str(req.error_rate),
+        "--seed-n",     str(req.seed_n),
+        "--quiet",
+    ]
+
     try:
-        r = http.post(
-            f"{MODEL_SERVER_URL}/mcp/call",
-            json={"tool": "inject_drift", "params": {"type": "none"}},
-            timeout=10,
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(PROJECT_ROOT),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            env={**os.environ, "PYTHONPATH": str(PROJECT_ROOT)},
         )
-        r.raise_for_status()
-        return r.json()
+        _generator_proc = proc
+        _generator_state = {
+            "running":    True,
+            "dataset":    req.dataset,
+            "pid":        proc.pid,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        }
+        logger.info("Generator started — pid=%d dataset=%s", proc.pid, req.dataset)
     except Exception as e:
-        raise HTTPException(502, f"Drift reset failed: {e}")
+        raise HTTPException(500, f"Failed to start generator: {e}")
+
+    return {"status": "started", "pid": _generator_state["pid"], "dataset": req.dataset}
 
 
-@app.get("/drift/status")
-async def drift_status():
-    """Get current drift config from the model server."""
+@app.post("/generator/stop")
+async def stop_generator():
+    """Stop the transaction generator subprocess."""
+    global _generator_proc, _generator_state
+
+    if not _proc_alive(_generator_proc):
+        _generator_state["running"] = False
+        return {"status": "not_running"}
+
     try:
-        r = http.post(
-            f"{MODEL_SERVER_URL}/mcp/call",
-            json={"tool": "get_drift_status", "params": {}},
-            timeout=10,
-        )
-        r.raise_for_status()
-        return r.json()
+        _generator_proc.terminate()
+        _generator_proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        _generator_proc.kill()
     except Exception as e:
-        raise HTTPException(502, f"Could not reach model server: {e}")
+        logger.warning("Error stopping generator: %s", e)
+
+    pid = _generator_state.get("pid")
+    _generator_proc = None
+    _generator_state = {
+        "running":    False,
+        "dataset":    _generator_state.get("dataset"),
+        "pid":        None,
+        "started_at": None,
+    }
+    logger.info("Generator stopped — pid=%s", pid)
+    return {"status": "stopped"}
+
+
+@app.get("/generator/status")
+async def generator_status():
+    """Return whether the generator is running, which dataset, and PID."""
+    global _generator_proc, _generator_state
+
+    alive = _proc_alive(_generator_proc)
+    if not alive and _generator_state["running"]:
+        # Process died on its own
+        _generator_state["running"] = False
+        _generator_state["pid"]     = None
+
+    return {
+        "running":    _generator_state["running"] and alive,
+        "dataset":    _generator_state.get("dataset"),
+        "pid":        _generator_state.get("pid") if alive else None,
+        "started_at": _generator_state.get("started_at"),
+        "active_dataset_file": _read_active_dataset(),
+    }
 
 # ── health endpoint ───────────────────────────────────────────────────────────
 
@@ -416,21 +515,18 @@ async def health():
     """Check reachability of all dependent services."""
     results = {}
 
-    # Ollama
     try:
         r = http.get(f"{OLLAMA_URL}/api/tags", timeout=5)
         results["ollama"] = r.ok
     except Exception:
         results["ollama"] = False
 
-    # Model server
     try:
         r = http.get(f"{MODEL_SERVER_URL}/health", timeout=5)
         results["model_server"] = r.ok
     except Exception:
         results["model_server"] = False
 
-    # ChromaDB
     try:
         from mlops_agents.rag.store import RAGStore
         rag = RAGStore()
@@ -438,7 +534,6 @@ async def health():
     except Exception:
         results["chromadb"] = False
 
-    # MLflow (via model server watcher — if model server is up, MLflow auth is ok)
     results["mlflow"] = results["model_server"]
 
     overall = all(results.values())
@@ -452,7 +547,7 @@ async def health():
 
 if __name__ == "__main__":
     import uvicorn
-    
+
     uvicorn.run(
         "api.main:app",
         host="0.0.0.0",
