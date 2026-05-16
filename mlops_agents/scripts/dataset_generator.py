@@ -251,6 +251,7 @@ def make_gradual_drift(df: pd.DataFrame, steps: int = GRADUAL_STEPS) -> None:
 # ── main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
+    global OUT_DIR
     parser = argparse.ArgumentParser(
         description="Generate drifted dataset CSVs from creditcard.csv"
     )
@@ -270,7 +271,6 @@ def main() -> None:
         print("Download from: kaggle datasets download mlg-ulb/creditcardfraud -p ./data --unzip")
         sys.exit(1)
 
-    global OUT_DIR
     OUT_DIR = out_dir
 
     print(f"Loading {data_path} …")

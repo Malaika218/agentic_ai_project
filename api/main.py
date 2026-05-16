@@ -54,8 +54,9 @@ logger = logging.getLogger("api")
 MODEL_SERVER_URL = os.getenv("FRAUD_MODEL_MCP_URL", "http://localhost:8080")
 OLLAMA_URL       = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
 PROJECT_ROOT     = Path(__file__).parent.parent
-DATASETS_DIR     = PROJECT_ROOT / "data" / "datasets"
-ACTIVE_DATASET_FILE = PROJECT_ROOT / "data" / "active_dataset.json"
+DATASETS_DIR     = PROJECT_ROOT / "mlops_agents" / "data" / "datasets"
+SCRIPTS_DIR = PROJECT_ROOT / "mlops_agents" / "scripts"
+ACTIVE_DATASET_FILE = PROJECT_ROOT / "mlops_agents" / "data" / "active_dataset.json"
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -323,7 +324,7 @@ async def create_datasets(background_tasks: BackgroundTasks):
     Run dataset_generator.py to create all scenario CSVs in data/datasets/.
     This is a one-time setup step.
     """
-    script_path = PROJECT_ROOT / "scripts" / "dataset_generator.py"
+    script_path = SCRIPTS_DIR / "dataset_generator.py"
     if not script_path.exists():
         raise HTTPException(404, f"dataset_generator.py not found at {script_path}")
 
@@ -421,7 +422,7 @@ async def start_generator(req: GeneratorStartRequest):
     if not dataset_csv.exists():
         raise HTTPException(404, f"Dataset not found: {dataset_csv}. Run POST /datasets/create first.")
 
-    script_path = PROJECT_ROOT / "scripts" / "transaction_generator.py"
+    script_path = SCRIPTS_DIR / "transaction_generator.py"
     if not script_path.exists():
         raise HTTPException(404, f"transaction_generator.py not found at {script_path}")
 

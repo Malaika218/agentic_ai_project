@@ -218,6 +218,7 @@ c1, c2, _ = st.columns([2, 2, 4])
 with c1:
     if st.button("⚙  Create All Datasets", use_container_width=True):
         try:
+            st.write(f"Attempting to connect to: `{API}/datasets/create`")
             r = requests.post(f"{API}/datasets/create", timeout=10)
             r.raise_for_status()
             st.info("Dataset generation started in background — refresh in ~30 s")

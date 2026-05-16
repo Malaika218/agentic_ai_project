@@ -6,7 +6,7 @@ Run with:
 """
 
 import streamlit as st
-from utils.session import init_session
+from utils.session import init_session, sync_api_url, sync_model_url
 
 init_session()
 
@@ -258,19 +258,17 @@ with st.sidebar:
 
     api_url = st.text_input(
         "API endpoint",
-        key="api_url",
+        key="_api_url",
         label_visibility="visible",
+        on_change=sync_api_url,
     )
-    if "api_url" not in st.session_state:
-        st.session_state["api_url"] = api_url
 
     model_url = st.text_input(
         "Model server",
-        key="model_url",
+        key="_model_url",
         label_visibility="visible",
+        on_change=sync_model_url,
     )
-    if "model_url" not in st.session_state:
-        st.session_state["model_url"] = model_url
 
     st.markdown("<div style='height:8px'></div>", unsafe_allow_html=True)
 
@@ -278,7 +276,7 @@ with st.sidebar:
     if st.button("↺  check health", use_container_width=True):
         try:
             import requests
-            r = requests.get(f"{api_url}/health", timeout=4)
+            r = requests.get(f"{api_url}/health", timeout=60)
             s = r.json().get("services", {})
             for svc, ok in s.items():
                 icon = "●" if ok else "○"
