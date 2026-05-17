@@ -55,4 +55,9 @@ class AgentState(TypedDict, total=False):
     # ── Retrain prescription (Diagnosis Agent → Remediation Agent) ──────────
     retrain_prescription: Optional[dict]   # full structured prescription
     drift_onset_at: Optional[str]          # ISO-8601 — when drift started
-    drifted_features: Optional[list[str]]  # feature names with high drift
+    
+    reference_histograms:  Optional[dict]   # per-feature reference from training
+    production_histograms: Optional[dict]   # per-feature current production
+    per_feature_psi:       Optional[dict]   # PSI per feature — populated by diagnosis agent
+    per_feature_ks:        Optional[dict]   # KS statistic per feature
+    drifted_features:      Optional[list[str]]  # already exists — now computed not guessed
