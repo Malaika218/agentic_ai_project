@@ -124,7 +124,7 @@ class DiagnosisOutput(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def _build_diagnosis_llm() -> Any:
+def _build_diagnosis_llm():
     model_name = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
     ollama_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
     return ChatOllama(
@@ -223,7 +223,7 @@ Instructions: Formulate a cohesive root cause evaluation by contrasting data his
     llm = _build_diagnosis_llm()
 
     try:
-        result = llm.invoke([
+        result: DiagnosisOutput = llm.invoke([
             SystemMessage(content=system_prompt),
             HumanMessage(content=prompt)
         ])
