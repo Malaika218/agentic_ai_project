@@ -179,9 +179,18 @@ def monitor_agent(state: AgentState, rag: RAGStore) -> AgentState:
         active_dataset_name = json.load(f).get("dataset", "baseline")
     metrics["active_dataset"] = active_dataset_name
 
+    # Add a unified metadata footprint that matches what the model server uses
+    metrics["metadata"] = {
+        "model_name": model_id,
+        "model_version": model_version,
+    }
+
     return {
         **state,
         "metrics": metrics,
+        "model_id": model_id,          # Explicitly saved to top-level state
+        "environment": environment,    # Explicitly saved to top-level state
+        "model_version": model_version,
         "severity": result.severity,
         "thresholds": thresholds,
         "messages": state.get("messages", []) + [
