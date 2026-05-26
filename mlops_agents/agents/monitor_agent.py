@@ -101,7 +101,7 @@ def _build_severity_llm() -> Any:
     )
 
 def monitor_agent(state: AgentState, rag: RAGStore) -> AgentState:
-    model_id = state.get("model_id", os.getenv("DEFAULT_MODEL_ID", ""))
+    model_id = state.get("model_id", os.getenv("DEFAULT_MODEL_ID", "main.default.fraud_classifier_v1"))
     environment = state.get("environment", os.getenv("DEFAULT_ENVIRONMENT", "production"))
     model_version = state.get("model_version", os.getenv("DEFAULT_MODEL_VERSION", "1"))
     
