@@ -21,6 +21,13 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 from dotenv import load_dotenv
+import json
+import subprocess
+import sys
+
+import requests
+
+from pathlib import Path
 
 load_dotenv()
 
@@ -31,6 +38,11 @@ load_dotenv()
 
 class ToolExecutionError(Exception):
     """Raised when a tool call fails and cannot be retried."""
+
+
+# Hardcoded absolute path reference as per your architecture spec
+SCRIPT_ABS_PATH = "/home/ali/fraud_model_server/model_server/scripts/train.py"
+LOCKFILE_ABS_PATH = "/home/ali/fraud_model_server/model_server/model/.retrain.lock"
 
 
 # ---------------------------------------------------------------------------
@@ -48,22 +60,75 @@ def trigger_retraining_pipeline(
     active_dataset:  str          = "baseline",
 ) -> dict[str, Any]:
     """
-    Dispatch a GitHub Actions workflow to retrain the model,
-    forwarding the full structured retrain prescription.
+    Spawns background training subprocess locally or dispatches cloud workflow.
+    Aligns paths seamlessly between agentic_ai_project and fraud_model_server environments.
     """
-    import json, requests
+    prescription = prescription or {}
+    current_metrics = current_metrics or {}
 
-    prescription     = prescription or {}
-    current_metrics  = current_metrics or {}
-
-    # check if retrain already in progress — avoid duplicate dispatches
     if _is_retrain_in_progress():
-        logger.info("Retrain already in progress — skipping dispatch.")
-        return {
-            "status": "skipped",
-            "detail": "Retrain workflow already in progress.",
-        }
+        logger.info("Retrain already in progress — skipping execution.")
+        return {"status": "skipped", "detail": "Retrain execution loop already active."}
 
+    # ── LOCAL SUBPROCESS MODE ────────────────────────────────────────────────
+    if os.getenv("LOCAL_MODE", "false").lower() == "true":
+        logger.info("[LOCAL MODE] Spawning train.py process context...")
+
+        # TARGET CWD: Set this to the parent folder of scripts (".../model_server")
+        # This forces Path("./data/creditcard.csv") inside train.py to resolve to
+        # /home/ali/fraud_model_server/model_server/data/creditcard.csv
+        target_cwd = str(Path(SCRIPT_ABS_PATH).parent.parent)
+
+        local_env = os.environ.copy()
+        local_env.update({
+            "MODEL_ID":            str(model_id),
+            "ENVIRONMENT":         str(environment),
+            "TRIGGERED_BY":        str(triggered_by),
+            "FULL_TRAIN":            "true",
+            "DRIFT_DATASET":         str(active_dataset),
+            "DATA_STRATEGY":         str(prescription.get("data_strategy", "recent_window")),
+            "WINDOW_DAYS":           str(prescription.get("window_days", 30)),
+            "DRIFT_PERIOD_WEIGHT":   str(prescription.get("drift_period_weight", 1.5)),
+            "EXCLUDE_BEFORE":        str(prescription.get("exclude_before", "")),
+            "REFIT_PREPROCESSORS":   str(prescription.get("refit_preprocessors", True)).lower(),
+            "DRIFTED_FEATURES":      json.dumps(prescription.get("drifted_features", [])),
+            "OPTIMIZE_FOR":          str(prescription.get("optimize_for", "recall")),
+            "TARGET_RECALL":         str(prescription.get("target_recall", 0.80)),
+            "TARGET_ROC_AUC":        str(prescription.get("target_roc_auc", 0.88)),
+            "DEPLOYMENT_STRATEGY":   str(prescription.get("deployment_strategy", "canary")),
+        })
+
+        try:
+            # Launch background process asynchronously
+            process = subprocess.Popen(
+                [sys.executable, SCRIPT_ABS_PATH],
+                env=local_env,
+                cwd=target_cwd,  # Crucial alignment step
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
+            )
+
+            # Drop the local process lockfile tracking asset
+            lock_payload = {
+                "pid": process.pid,
+                "started_at": Path(SCRIPT_ABS_PATH).stat().st_mtime, # Mock time or use datetime
+                "model_id": model_id
+            }
+            lock_file = Path(LOCKFILE_ABS_PATH)
+            lock_file.parent.mkdir(parents=True, exist_ok=True)
+            lock_file.write_text(json.dumps(lock_payload))
+
+            logger.info(f"[LOCAL MODE] Successfully spawned train.py at PID: {process.pid}")
+            return {
+                "status": "success",
+                "detail": f"LOCAL SUCCESS: Training script spawned in background. PID={process.pid}",
+                "local_pid": process.pid
+            }
+        except Exception as local_exc:
+            logger.error("[LOCAL MODE] Failed launching local training subprocess: %s", local_exc)
+            return {"status": "failed", "detail": f"Local process spawn error: {local_exc}"}
+
+    # ── 2. CLOUD GITHUB ACTIONS EXECUTION MODE (Original Fallback) ──────────
     try:
         token       = os.environ["GITHUB_TOKEN"]
         owner       = os.environ["GITHUB_OWNER"]
@@ -145,9 +210,32 @@ def trigger_retraining_pipeline(
     except Exception as exc:
         logger.error("trigger_retraining_pipeline failed: %s", exc)
         return {"status": "failed", "detail": str(exc)}
-
-
+    
 def _is_retrain_in_progress() -> bool:
+    """Checks for active local lockfile or cloud workflow status."""
+    if os.getenv("LOCAL_MODE", "false").lower() == "true":
+        lock_file = Path(LOCKFILE_ABS_PATH)
+        if lock_file.exists():
+            try:
+                lock_data = json.loads(lock_file.read_text())
+                pid = lock_data.get("pid")
+                if pid:
+                    os.kill(pid, 0)  # Validates if PID is active in OS
+                    logger.info(f"[LOCAL CHECK] Retrain active. Found process PID: {pid}")
+                    return True
+            except ProcessLookupError:
+                logger.warning(f"[LOCAL CHECK] Stale lockfile found (PID {pid} dead). Cleaning up.")
+                lock_file.unlink(missing_ok=True)
+            except Exception as e:
+                logger.error(f"Error checking local training lockfile: {e}")
+                return True
+        return False
+    
+    else:
+        return _is_retrain_in_progress_gh()
+
+
+def _is_retrain_in_progress_gh() -> bool:
     """Check GitHub Actions for an already-running retrain workflow."""
     try:
         import requests
