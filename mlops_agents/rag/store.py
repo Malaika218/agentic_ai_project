@@ -120,6 +120,29 @@ class RAGStore:
     def _flatten_meta(self, d: dict) -> dict:
         return {k: self._safe_meta(v) for k, v in d.items() if v is not None}
 
+    @staticmethod
+    def _safe_float(value: Any, default: float = 0.0) -> float:
+        """Coerce a value to float, returning `default` when value is None or invalid."""
+        try:
+            if value is None:
+                return default
+            return float(value)
+        except (TypeError, ValueError):
+            return default
+
+    @staticmethod
+    def _safe_int(value: Any, default: int = 0) -> int:
+        """Coerce a value to int, returning `default` when value is None or invalid."""
+        try:
+            if value is None:
+                return default
+            return int(value)
+        except (TypeError, ValueError):
+            try:
+                return int(float(value))
+            except Exception:
+                return default
+
     
     def save_dynamic_thresholds(self, model_id: str, thresholds: dict) -> str:
         """
@@ -182,10 +205,10 @@ class RAGStore:
                 "recommended_action": state.get("recommended_action", ""),
                 "remediation_status": state.get("remediation_status", ""),
                 "human_approved": bool(state.get("human_approved", False)),
-                "accuracy": float(metrics.get("accuracy", 0.0)),
-                "drift_score": float(metrics.get("drift_score", 0.0)),
-                "latency_p99_ms": float(metrics.get("latency_p99_ms", 0.0)),
-                "error_rate": float(metrics.get("error_rate", 0.0)),
+                "accuracy": float(metrics.get("accuracy")) if metrics.get("accuracy") is not None else 0.0,
+                "drift_score": float(metrics.get("drift_score")) if metrics.get("drift_score") is not None else 0.0,
+                "latency_p99_ms": float(metrics.get("latency_p99_ms")) if metrics.get("latency_p99_ms") is not None else 0.0,
+                "error_rate": float(metrics.get("error_rate")) if metrics.get("error_rate") is not None else 0.0,
                 "created_at": created_at,
                 "resolved_at": self._now_iso(),
                 # Store the full JSON payload for retrieval
@@ -329,11 +352,11 @@ class RAGStore:
                 "model_version": metrics.get("model_version", "unknown"),
                 "environment": metrics.get("environment", "production"),
                 "severity": severity,
-                "accuracy": float(metrics.get("accuracy", 0.0)),
-                "drift_score": float(metrics.get("drift_score", 0.0)),
-                "latency_p99_ms": float(metrics.get("latency_p99_ms", 0.0)),
-                "error_rate": float(metrics.get("error_rate", 0.0)),
-                "prediction_count": int(metrics.get("prediction_count", 0)),
+                "accuracy": self._safe_float(metrics.get("accuracy")),
+                "drift_score": self._safe_float(metrics.get("drift_score")),
+                "latency_p99_ms": self._safe_float(metrics.get("latency_p99_ms")),
+                "error_rate": self._safe_float(metrics.get("error_rate")),
+                "prediction_count": self._safe_int(metrics.get("prediction_count")),
                 "sampled_at": sampled_at,
             }
         )

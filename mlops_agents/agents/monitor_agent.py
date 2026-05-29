@@ -44,6 +44,7 @@ class SeverityClassification(BaseModel):
     @field_validator("confidence", mode="before")
     @classmethod
     def clamp_confidence(cls, v: Any) -> float:
+        print(f"confidence data type: {type(v)}")
         try: return max(0.0, min(1.0, float(v)))
         except (TypeError, ValueError): return 0.5
 
@@ -170,6 +171,8 @@ def monitor_agent(state: AgentState, rag: RAGStore) -> AgentState:
     Historical runs: {json.dumps(trend[:3])}
 
     Determine if metrics fall out-of-bounds and categorize severity Level. Ensure critical drops yield immediate 'critical' classifications."""
+
+    print(f"[Monitor Agent] Prompt: {prompt}")
 
     llm = _build_severity_llm()
     try:
