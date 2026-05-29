@@ -65,8 +65,8 @@ def route_after_diagnosis(
     Minor and critical go straight to remediation.
     """
     severity = state.get("severity", "minor")
-    if severity == "major":
-        logger.info("Severity=major — routing to human_approval node.")
+    if severity in ("critical","major"):
+        logger.info("[LangGraph Workflow] High severity incident — routing to human_approval node.")
         return "human_approval"
     return "remediation"
 
