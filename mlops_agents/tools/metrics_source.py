@@ -57,33 +57,18 @@ class ModelMetrics:
     environment: str
     sampled_at: str                      # ISO-8601 UTC
 
-    # Performance
+    # Performance metrics
     accuracy: float | None = None        # 0–1
-    f1_score: float | None = None        # 0–1
+    error_rate: float | None = None      # 0–1
+    f1: float | None = None              # 0–1
     precision: float | None = None       # 0–1
     recall: float | None = None          # 0–1
-    auc_roc: float | None = None         # 0–1
+    roc_auc: float | None = None         # 0–1
 
-    # Drift
-    drift_score: float | None = None     # PSI or JS-divergence, 0–1 scale
-    feature_drift: dict | None = None    # per-feature drift scores
-    label_drift: float | None = None     # prediction distribution shift
-
-    # Serving / infra
-    latency_p50_ms: float | None = None
-    latency_p95_ms: float | None = None
-    latency_p99_ms: float | None = None
-    error_rate: float | None = None      # 0–1
-    prediction_count: int | None = None  # in the last monitoring window
-    throughput_rps: float | None = None  # requests per second
-
-    # Model registry metadata
-    training_data_hash: str | None = None
-    last_retrain_date: str | None = None  # ISO-8601
-    deployed_at: str | None = None        # ISO-8601
-
-    # Raw extras (anything platform-specific)
-    extras: dict = field(default_factory=dict)
+    # Risk and latency
+    fraud_rate: float | None = None      # 0–1
+    latency_ms: float | None = None      # milliseconds
+    sample_size: int | None = None       # number of samples
 
     def to_dict(self) -> dict[str, Any]:
         import dataclasses
@@ -173,8 +158,8 @@ class AzureMonitorSource:
                     if dp.average is not None:
                         parsed[metric.name] = dp.average
 
-        # Fetch accuracy / drift from Azure ML Data Drift monitor
-        accuracy, drift_score = self._fetch_ml_monitor_metrics(
+        # Fetch accuracy from Azure ML Data Drift monitor
+        accuracy, _ = self._fetch_ml_monitor_metrics(
             model_id, environment, start, end
         )
 
@@ -183,13 +168,15 @@ class AzureMonitorSource:
             model_version=self._get_model_version(model_id),
             environment=environment,
             sampled_at=end.isoformat(),
-            latency_p50_ms=parsed.get("RequestLatency_P50"),
-            latency_p95_ms=parsed.get("RequestLatency_P95"),
-            latency_p99_ms=parsed.get("RequestLatency_P99"),
-            error_rate=parsed.get("ModelErrorRate"),
-            throughput_rps=parsed.get("RequestsPerMinute"),
             accuracy=accuracy,
-            drift_score=drift_score,
+            error_rate=parsed.get("ModelErrorRate"),
+            f1=None,
+            precision=None,
+            recall=None,
+            roc_auc=None,
+            fraud_rate=None,
+            latency_ms=parsed.get("RequestLatency_P99"),
+            sample_size=None,
         )
 
     def _fetch_ml_monitor_metrics(
@@ -306,23 +293,11 @@ class PrometheusSource:
         accuracy = self._query(
             f'avg_over_time(mlops_model_accuracy{{{env_filter}}}[{window}])'
         )
-        drift = self._query(
-            f'avg_over_time(mlops_model_drift_score{{{env_filter}}}[{window}])'
-        )
         lat_p99 = self._query(
             f'histogram_quantile(0.99, rate(mlops_request_latency_seconds_bucket{{{env_filter}}}[{window}])) * 1000'
         )
-        lat_p95 = self._query(
-            f'histogram_quantile(0.95, rate(mlops_request_latency_seconds_bucket{{{env_filter}}}[{window}])) * 1000'
-        )
-        lat_p50 = self._query(
-            f'histogram_quantile(0.50, rate(mlops_request_latency_seconds_bucket{{{env_filter}}}[{window}])) * 1000'
-        )
         errors = self._query(
             f'rate(mlops_request_errors_total{{{env_filter}}}[{window}])'
-        )
-        preds = self._query(
-            f'increase(mlops_predictions_total{{{env_filter}}}[{window}])'
         )
 
         return ModelMetrics(
@@ -331,12 +306,14 @@ class PrometheusSource:
             environment=environment,
             sampled_at=datetime.now(timezone.utc).isoformat(),
             accuracy=accuracy,
-            drift_score=drift,
-            latency_p50_ms=lat_p50,
-            latency_p95_ms=lat_p95,
-            latency_p99_ms=lat_p99,
             error_rate=errors,
-            prediction_count=int(preds) if preds is not None else None,
+            f1=None,
+            precision=None,
+            recall=None,
+            roc_auc=None,
+            fraud_rate=None,
+            latency_ms=lat_p99,
+            sample_size=None,
         )
 
 
@@ -427,28 +404,27 @@ class MLflowSource:
         f1 = _get("f1_score")
         precision = _get("precision")
         recall = _get("recall")
-        auc = _get("auc_roc")
-        drift = _get("drift_score")
-        avg_prec = _get("avg_precision")
+        roc_auc = _get("auc_roc")
         latency = _get("latency_ms")
+        fraud_rate = _get("fraud_rate")
+        sample_size = _get("sample_size")
+        error_rate = _get("error_rate")
 
-        # Map collected metrics into ModelMetrics shape. If the source only
-        # provides a single latency metric, place it into p95 bucket as a
-        # reasonable default for monitoring summaries.
+        # Map collected metrics into simplified ModelMetrics shape
         return ModelMetrics(
             model_id=model_id,
             model_version=run.get("tags.mlflow.source.git.commit", "unknown"),
             environment=environment,
             sampled_at=datetime.now(timezone.utc).isoformat(),
             accuracy=accuracy,
-            f1_score=f1,
+            f1=f1,
             precision=precision,
             recall=recall,
-            auc_roc=auc,
-            drift_score=drift,
-            throughput_rps=None,
-            latency_p95_ms=latency,
-            extras={"avg_precision": avg_prec} if avg_prec is not None else {},
+            roc_auc=roc_auc,
+            error_rate=error_rate,
+            fraud_rate=fraud_rate,
+            latency_ms=latency,
+            sample_size=sample_size,
         )
 
 

@@ -59,10 +59,6 @@ def _threshold(env_key: str, default: float) -> float:
 THRESHOLDS = {
     "accuracy_critical":   lambda: _threshold("THRESHOLD_ACCURACY_CRITICAL",  0.65),
     "accuracy_major":      lambda: _threshold("THRESHOLD_ACCURACY_MAJOR",     0.72),
-    "accuracy_minor":      lambda: _threshold("THRESHOLD_ACCURACY_MINOR",     0.80),
-    "drift_critical":      lambda: _threshold("THRESHOLD_DRIFT_CRITICAL",     0.60),
-    "drift_major":         lambda: _threshold("THRESHOLD_DRIFT_MAJOR",        0.35),
-    "drift_minor":         lambda: _threshold("THRESHOLD_DRIFT_MINOR",        0.20),
     "latency_critical_ms": lambda: _threshold("THRESHOLD_LATENCY_CRITICAL_MS", 2000),
     "latency_major_ms":    lambda: _threshold("THRESHOLD_LATENCY_MAJOR_MS",   1000),
     "error_rate_critical": lambda: _threshold("THRESHOLD_ERROR_RATE_CRITICAL", 0.10),
@@ -164,13 +160,26 @@ def monitor_agent(state: AgentState, rag: RAGStore) -> AgentState:
     trend = rag.query_recent_metrics(model_id=model_id, n_results=10, environment=environment)
 
     # Agent reasoning prompt replacing structural hardcoded if-else statements
-    prompt = f"""You are an autonomous MLOps evaluator. Analyze the operational metrics against the target context bounds.
-    
-    Current telemetry signals: {json.dumps(metrics)}
-    Dynamic reference constraints: {json.dumps(thresholds)}
-    Historical runs: {json.dumps(trend[:3])}
+    prompt = f"""You are an autonomous MLOps monitor. Evaluate production metrics against alert thresholds and classify severity.
 
-    Determine if metrics fall out-of-bounds and categorize severity Level. Ensure critical drops yield immediate 'critical' classifications."""
+METRIC INTERPRETATION RULES:
+- accuracy, f1, precision, recall, roc_auc: LOWER is BAD (< threshold triggers alert)
+- error_rate, fraud_rate, latency_ms: HIGHER is BAD (> threshold triggers alert)
+
+SEVERITY DECISION LOGIC:
+- "critical": Breach CRITICAL threshold on any metric (accuracy < {thresholds.get('accuracy_critical', 0.65)} OR error_rate > {thresholds.get('error_rate_critical', 0.10)} OR latency_ms > {thresholds.get('latency_critical_ms', 2000)})
+- "major": Breach MAJOR threshold but not critical (accuracy < {thresholds.get('accuracy_major', 0.72)} OR error_rate > {thresholds.get('error_rate_major', 0.05)} OR latency_ms > {thresholds.get('latency_major_ms', 1000)})
+- "minor": Any other performance degradation vs historical trend
+- "none": All metrics within acceptable bounds
+
+CURRENT CONTEXT:
+Metrics snapshot: {json.dumps(metrics)}
+Alert thresholds: {json.dumps(thresholds)}
+Historical trend (last 3 runs): {json.dumps(trend[:3])}
+
+TASK: Compare each metric against its thresholds. If accuracy < critical threshold, classify as CRITICAL. 
+If any major threshold breached, classify as MAJOR. Check historical trend for sustained degradation (minor).
+Output severity, confidence (0.0-1.0), and reasoning."""
 
     print(f"[Monitor Agent] Prompt: {prompt}")
 

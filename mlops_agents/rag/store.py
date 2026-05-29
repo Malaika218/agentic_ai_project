@@ -291,14 +291,14 @@ class RAGStore:
 
         Returns a summary dict with counts, rates, and common actions.
         """
-        where: dict = {}
+        filters: dict[str, Any] = {}
         if model_id:
-            where["model_id"] = model_id
+            filters["model_id"] = model_id
         if environment:
-            where["environment"] = environment
+            filters["environment"] = environment
 
         results = self._incidents.get(
-            where=where if where else None,
+            where=self._build_where_clause(filters),
             include=["metadatas"],
             limit=limit,
         )
