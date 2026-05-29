@@ -58,11 +58,41 @@ DATASETS_DIR     = PROJECT_ROOT / "mlops_agents" / "data" / "datasets"
 SCRIPTS_DIR = PROJECT_ROOT / "mlops_agents" / "scripts"
 ACTIVE_DATASET_FILE = PROJECT_ROOT / "mlops_agents" / "data" / "active_dataset.json"
 
+def _stop_generator_process() -> dict[str, Any]:
+    """Stop the generator subprocess using the same logic as the HTTP endpoint."""
+    global _generator_proc, _generator_state
+
+    if not _proc_alive(_generator_proc):
+        _generator_state["running"] = False
+        return {"status": "not_running"}
+
+    try:
+        _generator_proc.terminate()
+        _generator_proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        _generator_proc.kill()
+    except Exception as exc:
+        logger.warning("Error stopping generator: %s", exc)
+
+    pid = _generator_state.get("pid")
+    _generator_proc = None
+    _generator_state = {
+        "running":    False,
+        "dataset":    _generator_state.get("dataset"),
+        "pid":        None,
+        "started_at": None,
+    }
+    logger.info("Generator stopped — pid=%s", pid)
+    return {"status": "stopped"}
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     from mlops_agents.rag.init_collections import init
     init()
-    yield
+    try:
+        yield
+    finally:
+        _stop_generator_process()
 
 app = FastAPI(
     title="MLOps Agent API",
