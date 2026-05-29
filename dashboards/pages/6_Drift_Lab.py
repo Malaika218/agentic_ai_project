@@ -71,11 +71,11 @@ def section(title: str, sub: str = "") -> None:
 
 
 def api_get(path: str, **kwargs):
-    return requests.get(f"{API}{path}", timeout=6, **kwargs).json()
+    return requests.get(f"{API}{path}", timeout=120, **kwargs).json()
 
 
 def api_post(path: str, **kwargs):
-    return requests.post(f"{API}{path}", timeout=10, **kwargs).json()
+    return requests.post(f"{API}{path}", timeout=120, **kwargs).json()
 
 
 def model_server_call(tool: str, params: dict | None = None):
@@ -83,7 +83,7 @@ def model_server_call(tool: str, params: dict | None = None):
     r = requests.post(
         f"{model_url}/mcp/call",
         json={"tool": tool, "params": params or {}},
-        timeout=60,
+        timeout=120,
     )
     r.raise_for_status()
     return r.json()
@@ -197,7 +197,7 @@ for ds in datasets:
                     requests.post(
                         f"{API}/generator/start",
                         json={"dataset": name, "rate": 2.0, "seed_n": 500},
-                        timeout=10,
+                        timeout=120,
                     )
                     # immediately stop again — we just wanted the file written
                     api_post("/generator/stop")
@@ -219,7 +219,7 @@ with c1:
     if st.button("⚙  Create All Datasets", use_container_width=True):
         try:
             st.write(f"Attempting to connect to: `{API}/datasets/create`")
-            r = requests.post(f"{API}/datasets/create", timeout=10)
+            r = requests.post(f"{API}/datasets/create", timeout=120)
             r.raise_for_status()
             st.info("Dataset generation started in background — refresh in ~30 s")
         except Exception as e:
@@ -288,7 +288,7 @@ with g4:
                 r = requests.post(
                     f"{API}/generator/start",
                     json={"dataset": sel_dataset, "rate": rate, "error_rate": err_frac, "seed_n": 500},
-                    timeout=10,
+                    timeout=120,
                 )
                 r.raise_for_status()
                 st.success(f"Started — {rate} req/s on {sel_dataset}")
@@ -479,7 +479,7 @@ if active_ds_meta:
             r = requests.post(
                 f"{API}/runs",
                 json={"model_id": "fraud-classifier-v1", "environment": "production"},
-                timeout=6,
+                timeout=120,
             )
             r.raise_for_status()
             tid = r.json()["thread_id"]
