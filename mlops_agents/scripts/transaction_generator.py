@@ -232,7 +232,10 @@ def run(
             if is_malformed:
                 payload = make_malformed_payload()
             else:
-                payload = {k: v for k, v in row.items() if k != "_true_label"}
+                # Forward the row verbatim including _true_label so the model
+                # server can compute real precision/recall/accuracy. The server
+                # pops _true_label from the payload before feature extraction.
+                payload = dict(row)
 
             try:
                 r = requests.post(
