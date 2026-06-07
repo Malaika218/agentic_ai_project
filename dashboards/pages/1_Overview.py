@@ -4,10 +4,15 @@ dashboard/pages/1_Overview.py
 Overview page — model health, trigger run, live pipeline status.
 """
 
+import os
 import time
 import streamlit as st
 import requests
+from dotenv import load_dotenv
 from utils.session import init_session
+
+load_dotenv()
+DEFAULT_MODEL_ID = os.getenv("DEFAULT_MODEL_ID", "main.default.fraud_classifier_v1")
 
 init_session()
 
@@ -168,7 +173,7 @@ with st.container():
     with tc1:
         model_id = st.text_input(
             "Model ID",
-            value="fraud-classifier-v1",
+            value=DEFAULT_MODEL_ID,
             key="trigger_model_id",
             label_visibility="visible",
         )
@@ -279,6 +284,124 @@ else:
             </div>
             """, unsafe_allow_html=True)
 
+        # token + cost panel — populated by every agent that called an LLM.
+        tu_totals = run.get("token_totals") or {}
+        tu_by_agent = run.get("token_usage") or {}
+        if tu_totals or tu_by_agent:
+            section("LLM Token Usage")
+            tc1, tc2, tc3, tc4 = st.columns(4)
+            with tc1:
+                st.markdown(f"""
+                <div style="background:#111318;border:1px solid #1f2330;border-radius:6px;padding:14px 16px;">
+                    <div style="font-size:0.65rem;color:#555c72;letter-spacing:0.12em;">INPUT TOKENS</div>
+                    <div style="font-size:1.0rem;font-weight:600;color:#00d4ff;margin-top:6px;">
+                        {tu_totals.get('input_tokens', 0):,}
+                    </div>
+                </div>""", unsafe_allow_html=True)
+            with tc2:
+                st.markdown(f"""
+                <div style="background:#111318;border:1px solid #1f2330;border-radius:6px;padding:14px 16px;">
+                    <div style="font-size:0.65rem;color:#555c72;letter-spacing:0.12em;">OUTPUT TOKENS</div>
+                    <div style="font-size:1.0rem;font-weight:600;color:#9b59ff;margin-top:6px;">
+                        {tu_totals.get('output_tokens', 0):,}
+                    </div>
+                </div>""", unsafe_allow_html=True)
+            with tc3:
+                st.markdown(f"""
+                <div style="background:#111318;border:1px solid #1f2330;border-radius:6px;padding:14px 16px;">
+                    <div style="font-size:0.65rem;color:#555c72;letter-spacing:0.12em;">TOTAL TOKENS</div>
+                    <div style="font-size:1.0rem;font-weight:600;color:#e8eaf0;margin-top:6px;">
+                        {tu_totals.get('total_tokens', 0):,}
+                    </div>
+                </div>""", unsafe_allow_html=True)
+            with tc4:
+                cost = tu_totals.get('cost_usd', 0) or 0
+                cost_str = f"${cost:.6f}" if cost < 0.01 else f"${cost:.4f}"
+                st.markdown(f"""
+                <div style="background:#111318;border:1px solid #1f2330;border-radius:6px;padding:14px 16px;">
+                    <div style="font-size:0.65rem;color:#555c72;letter-spacing:0.12em;">COST (USD)</div>
+                    <div style="font-size:1.0rem;font-weight:600;color:#00e5a0;margin-top:6px;">
+                        {cost_str}
+                    </div>
+                </div>""", unsafe_allow_html=True)
+
+            if tu_by_agent:
+                # per-agent breakdown
+                rows = "".join(
+                    f"<tr>"
+                    f"<td style='padding:6px 12px;color:#e8eaf0;'>{agent}</td>"
+                    f"<td style='padding:6px 12px;color:#8b91a8;font-size:0.72rem;'>{stats.get('model','—')}</td>"
+                    f"<td style='padding:6px 12px;text-align:right;color:#00d4ff;'>{stats.get('input_tokens',0):,}</td>"
+                    f"<td style='padding:6px 12px;text-align:right;color:#9b59ff;'>{stats.get('output_tokens',0):,}</td>"
+                    f"<td style='padding:6px 12px;text-align:right;color:#555c72;'>{stats.get('calls',0)}</td>"
+                    f"<td style='padding:6px 12px;text-align:right;color:#00e5a0;'>${stats.get('cost_usd',0):.6f}</td>"
+                    f"</tr>"
+                    for agent, stats in tu_by_agent.items()
+                )
+                st.markdown(
+                    f"""
+                    <div style="margin-top:10px;padding:8px 0;background:#111318;
+                                border:1px solid #1f2330;border-radius:6px;overflow:hidden;">
+                      <table style="width:100%;border-collapse:collapse;font-size:0.78rem;
+                                    font-family:'JetBrains Mono',monospace;">
+                        <thead>
+                          <tr style="background:#181b22;color:#555c72;letter-spacing:0.1em;font-size:0.66rem;">
+                            <th style="padding:8px 12px;text-align:left;">AGENT</th>
+                            <th style="padding:8px 12px;text-align:left;">MODEL</th>
+                            <th style="padding:8px 12px;text-align:right;">INPUT</th>
+                            <th style="padding:8px 12px;text-align:right;">OUTPUT</th>
+                            <th style="padding:8px 12px;text-align:right;">CALLS</th>
+                            <th style="padding:8px 12px;text-align:right;">COST</th>
+                          </tr>
+                        </thead>
+                        <tbody>{rows}</tbody>
+                      </table>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+        # training logs — show whenever the run kicked off a retrain. The
+        # training subprocess runs asynchronously, so the pipeline can be
+        # `completed` while training is still churning; we keep polling on
+        # the log endpoint's `active` flag rather than the run status.
+        train_log = None
+        if run.get("remediation_action") == "trigger_retraining":
+            try:
+                train_log = requests.get(
+                    f"{API}/retrain/logs",
+                    params={"tail": 200},
+                    timeout=5,
+                ).json()
+            except Exception as e:
+                st.caption(f"Could not fetch training logs: {e}")
+
+        if train_log and train_log.get("lines"):
+            indicator = "● TRAINING" if train_log.get("active") else "○ FINISHED"
+            indicator_color = "#00d4ff" if train_log.get("active") else "#555c72"
+            log_name = train_log.get("log_name", "—")
+            total = train_log.get("total_lines", 0)
+            shown = train_log.get("tail", 0)
+
+            st.markdown(f"""
+            <div style="margin-top:12px;padding:12px 16px;background:#111318;
+                        border:1px solid #1f2330;border-radius:6px;">
+                <div style="display:flex;justify-content:space-between;align-items:center;
+                            font-size:0.65rem;color:#555c72;letter-spacing:0.12em;margin-bottom:8px;">
+                    <span>TRAINING LOGS</span>
+                    <span style="color:{indicator_color};">{indicator} · {log_name} · showing {shown} of {total}</span>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+            # Render log lines in a monospace code block — preserves whitespace
+            # without us hand-rolling HTML escaping.
+            st.code("\n".join(train_log["lines"]), language="text")
+
+            # If training is still in flight, keep polling.
+            if train_log.get("active"):
+                time.sleep(3)
+                st.rerun()
+
         # retrain prescription
         if run.get("retrain_prescription"):
             p = run["retrain_prescription"]
@@ -367,12 +490,12 @@ try:
     else:
         # header
         st.markdown("""
-        <div style="display:grid;grid-template-columns:160px 120px 80px 100px 100px 1fr;
+        <div style="display:grid;grid-template-columns:140px 110px 70px 90px 90px 110px 90px 1fr;
                     gap:8px;padding:8px 12px;
                     font-size:0.65rem;color:#555c72;letter-spacing:0.12em;
                     border-bottom:1px solid #1f2330;margin-bottom:4px;">
             <div>THREAD</div><div>STARTED</div><div>ENV</div>
-            <div>STATUS</div><div>SEVERITY</div><div>ACTION</div>
+            <div>STATUS</div><div>SEVERITY</div><div>TOKENS</div><div>COST</div><div>ACTION</div>
         </div>
         """, unsafe_allow_html=True)
 
@@ -386,11 +509,17 @@ try:
             sev_c      = SEV_COLOR.get(sev, "#555c72")
             stat_c     = STATUS_COLOR.get(status, "#555c72")
 
+            tt = run.get("token_totals") or {}
+            tokens_total = tt.get("total_tokens", 0)
+            tokens_str = f"{tokens_total:,}" if tokens_total else "—"
+            cost = float(tt.get("cost_usd", 0) or 0)
+            cost_str = ("$" + (f"{cost:.6f}" if 0 < cost < 0.01 else f"{cost:.4f}")) if cost else "—"
+
             is_active = run["thread_id"] == st.session_state.get("active_thread_id")
             bg = "rgba(0,212,255,0.04)" if is_active else "transparent"
 
             st.markdown(f"""
-            <div style="display:grid;grid-template-columns:160px 120px 80px 100px 100px 1fr;
+            <div style="display:grid;grid-template-columns:140px 110px 70px 90px 90px 110px 90px 1fr;
                         gap:8px;padding:9px 12px;
                         border-bottom:1px solid #1a1d26;background:{bg};
                         font-size:0.78rem;">
@@ -399,6 +528,8 @@ try:
                 <div style="color:#555c72;">{env}</div>
                 <div style="color:{stat_c};">● {status}</div>
                 <div style="color:{sev_c};">{sev.upper()}</div>
+                <div style="color:#e8eaf0;text-align:right;">{tokens_str}</div>
+                <div style="color:#00e5a0;text-align:right;">{cost_str}</div>
                 <div style="color:#8b91a8;">{action}</div>
             </div>
             """, unsafe_allow_html=True)
@@ -411,7 +542,10 @@ try:
             format_func=lambda x: x[:24] + "…" if x != "—" and len(x) > 24 else x,
             key="run_selector",
         )
-        if selected != "—":
+        # Only rerun when the selection differs from the current active thread —
+        # the selectbox value is persisted under `key`, so an unconditional
+        # `st.rerun()` here loops forever (the next render reads the same value).
+        if selected != "—" and selected != st.session_state.get("active_thread_id"):
             st.session_state["active_thread_id"] = selected
             st.rerun()
 
