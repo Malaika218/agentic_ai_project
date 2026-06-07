@@ -18,7 +18,19 @@ import logging
 import os
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
+
+# Anchor relative persist dirs to the repo root so every process (API, Streamlit,
+# scripts) opens the same Chroma store regardless of CWD.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+_DEFAULT_PERSIST_DIR = str(_REPO_ROOT / "api" / "rag_data")
+
+
+def _resolve_persist_dir() -> str:
+    raw = os.getenv("CHROMA_PERSIST_DIR", _DEFAULT_PERSIST_DIR)
+    p = Path(raw)
+    return str(p if p.is_absolute() else (_REPO_ROOT / p).resolve())
 
 import chromadb
 from chromadb.config import Settings
@@ -68,7 +80,7 @@ class RAGStore:
     def _build_client() -> chromadb.ClientAPI:
         host = os.getenv("CHROMA_HOST", "")
         port = int(os.getenv("CHROMA_PORT", "8000"))
-        persist_dir = os.getenv("CHROMA_PERSIST_DIR", "./rag_data")
+        persist_dir = _resolve_persist_dir()
 
         if host:
             return chromadb.HttpClient(

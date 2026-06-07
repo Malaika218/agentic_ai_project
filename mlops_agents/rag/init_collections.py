@@ -15,7 +15,8 @@ import logging
 import os
 import sys
 from datetime import datetime
-from mlops_agents.rag.store import RAGStore
+from pathlib import Path
+from mlops_agents.rag.store import RAGStore, _resolve_persist_dir
  
 
 import chromadb
@@ -114,7 +115,7 @@ COLLECTIONS: list[dict] = [
 # ---------------------------------------------------------------------------
 
 def _get_chroma_client() -> chromadb.ClientAPI:
-    persist_dir = os.getenv("CHROMA_PERSIST_DIR", "./rag_data")
+    persist_dir = _resolve_persist_dir()
     host = os.getenv("CHROMA_HOST", "")
     port = int(os.getenv("CHROMA_PORT", "8000"))
 

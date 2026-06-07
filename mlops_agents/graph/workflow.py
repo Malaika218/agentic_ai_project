@@ -7,11 +7,12 @@ Flow:
     [monitor] → route_by_severity
         ├── "none"     → END
         ├── "minor"    → [diagnosis] → [remediation] → [reporting] → END
-        ├── "critical" → [diagnosis] → [remediation] → [reporting] → END
+        ├── "critical" → [diagnosis] → [human_approval] → [remediation] → [reporting] → END
         └── "major"    → [diagnosis] → [human_approval] → [remediation] → [reporting] → END
 
-The RAGStore is instantiated once and injected into each node via functools.partial
-so agents don't need to create their own connections.
+Human-in-the-loop uses LangGraph's dynamic `interrupt()` function (the recommended
+HITL pattern — static `interrupt_before` breakpoints are intended for debugging).
+The orchestrator resumes the paused thread with `Command(resume=True/False)`.
 """
 
 from __future__ import annotations
@@ -23,8 +24,13 @@ from typing import Literal
 
 from langgraph.graph import StateGraph, END
 from langgraph.checkpoint.memory import MemorySaver
+from langgraph.types import interrupt
 
-from state import AgentState
+# Single checkpointer instance shared across all build_graph() calls so that
+# checkpointed state survives between the initial interrupted run and resume.
+_checkpointer = MemorySaver()
+
+from mlops_agents.state import AgentState
 from mlops_agents.rag.store import RAGStore
 from mlops_agents.agents.monitor_agent import monitor_agent
 from mlops_agents.agents.diagnosis_agent import diagnosis_agent
@@ -61,11 +67,11 @@ def route_after_diagnosis(
     state: AgentState,
 ) -> Literal["human_approval", "remediation"]:
     """
-    After diagnosis, major incidents require human approval.
-    Minor and critical go straight to remediation.
+    After diagnosis, major and critical incidents require human approval.
+    Minor incidents go straight to remediation.
     """
     severity = state.get("severity", "minor")
-    if severity in ("critical","major"):
+    if severity in ("critical", "major"):
         logger.info("[LangGraph Workflow] High severity incident — routing to human_approval node.")
         return "human_approval"
     return "remediation"
@@ -75,42 +81,45 @@ def route_after_diagnosis(
 # Human approval node
 # ---------------------------------------------------------------------------
 
-def human_approval_node(state: AgentState) -> AgentState:
+def human_approval_node(state: AgentState) -> dict:
     """
-    Human-in-the-loop checkpoint for major incidents.
+    Human-in-the-loop checkpoint.
 
-    Production behaviour:
-        - Raises GraphInterrupt so LangGraph pauses the thread.
-        - The external orchestrator (Slack webhook, dashboard) resumes the graph
-          with {"human_approved": True/False} injected into the state.
+    Calls LangGraph's `interrupt()` to pause execution. The payload below
+    surfaces to the orchestrator as `event["__interrupt__"][0].value` so the
+    dashboard knows what it's approving. The orchestrator resumes the thread
+    with `Command(resume=True)` (approve) or `Command(resume=False)` (reject);
+    that boolean becomes the return value of `interrupt()`.
 
-    The GraphInterrupt import is guarded so the graph can still be instantiated
-    in environments where the checkpoint backend is not configured.
+    NOTE: LangGraph re-runs the entire node from the top on resume, so this
+    function must stay side-effect-free up to the `interrupt()` call.
     """
-    try:
-        from langgraph.errors import GraphInterrupt  # available in langgraph ≥ 0.1
+    # HITL-disabled escape hatch (stable per-process — env var doesn't change
+    # mid-run, so the rule against conditionally skipping `interrupt()` calls
+    # within a node isn't violated).
+    if os.getenv("HUMAN_IN_THE_LOOP", "true").lower() != "true":
+        logger.info("HUMAN_IN_THE_LOOP disabled — auto-approving.")
+        return {"human_approved": True}
 
-        metrics: dict = state.get("metrics") or {}
-        raise GraphInterrupt(
-            {
-                "message": (
-                    f"Human approval required for MAJOR incident on "
-                    f"{metrics.get('model_id', 'unknown')} "
-                    f"({metrics.get('environment', 'production')})."
-                ),
-                "diagnosis": state.get("diagnosis", ""),
-                "recommended_action": state.get("recommended_action", ""),
-                "incident_metrics": metrics,
-            }
-        )
-    except ImportError:
-        # Fallback: auto-approve (for environments without checkpoint backend)
-        logger.warning(
-            "GraphInterrupt not available — auto-approving major incident. "
-            "Install langgraph>=0.1 and configure a checkpoint backend for "
-            "production human-in-the-loop behaviour."
-        )
-        return {**state, "human_approved": True}
+    metrics: dict = state.get("metrics") or {}
+    approved = interrupt(
+        {
+            "message": (
+                f"Human approval required for {state.get('severity', 'high')}-severity "
+                f"incident on {state.get('model_id', 'unknown')} "
+                f"({state.get('environment', 'production')})."
+            ),
+            "model_id": state.get("model_id"),
+            "environment": state.get("environment"),
+            "severity": state.get("severity"),
+            "diagnosis": state.get("diagnosis", ""),
+            "recommended_action": state.get("recommended_action", ""),
+            "incident_metrics": metrics,
+        }
+    )
+
+    logger.info("human_approval_node resumed — approved=%s", approved)
+    return {"human_approved": bool(approved)}
 
 
 def route_after_approval(
@@ -181,14 +190,9 @@ def build_graph(rag: RAGStore | None = None) -> StateGraph:
     builder.add_edge("remediation", "reporting")
     builder.add_edge("reporting", END)
 
-    # Use MemorySaver for thread checkpointing (swap for Redis/Postgres in production)
-    checkpointer = MemorySaver()
-    app = builder.compile(
-        checkpointer=checkpointer,
-        interrupt_before=["human_approval"]
-        if os.getenv("HUMAN_IN_THE_LOOP", "true").lower() == "true"
-        else [],
-    )
+    # No static `interrupt_before`: the dynamic `interrupt()` call inside
+    # human_approval_node handles pausing per the recommended HITL pattern.
+    app = builder.compile(checkpointer=_checkpointer)
 
     logger.info("LangGraph compiled successfully.")
     return app
