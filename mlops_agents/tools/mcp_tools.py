@@ -41,8 +41,9 @@ class ToolExecutionError(Exception):
 
 
 # Hardcoded absolute path reference as per your architecture spec
-SCRIPT_ABS_PATH = "/home/ali/fraud_model_server/model_server/scripts/train.py"
-LOCKFILE_ABS_PATH = "/home/ali/fraud_model_server/model_server/model/.retrain.lock"
+SCRIPT_PATH =  Path(__file__).parent.parent.parent / "fraud_model_server/model_server/scripts/train.py"
+LOCKFILE_PATH = Path(__file__).parent.parent.parent / "fraud_model_server/model_server/model/.retrain.lock"
+RETRAIN_LOG_DIR = Path(__file__).parent.parent.parent / "data/logs/retrain"
 
 
 # ---------------------------------------------------------------------------
@@ -54,9 +55,9 @@ def trigger_retraining_pipeline(
     environment:     str,
     reason:          str,
     severity:        str          = "unknown",
-    prescription:    dict         = None,
+    prescription:    dict         = None,   
     current_metrics: dict         = None,
-    triggered_by:    str          = "mlops-agent",
+    triggered_by:    str          = "remediation_agent",
     active_dataset:  str          = "baseline",
 ) -> dict[str, Any]:
     """
@@ -77,10 +78,13 @@ def trigger_retraining_pipeline(
         # TARGET CWD: Set this to the parent folder of scripts (".../model_server")
         # This forces Path("./data/creditcard.csv") inside train.py to resolve to
         # /home/ali/fraud_model_server/model_server/data/creditcard.csv
-        target_cwd = str(Path(SCRIPT_ABS_PATH).parent.parent)
+        target_cwd = str(Path(SCRIPT_PATH).parent.parent)
 
         local_env = os.environ.copy()
         local_env.update({
+            # Disable Python's stdio block-buffering so train.py prints reach
+            # the log file in real time and aren't lost on a crash mid-import.
+            "PYTHONUNBUFFERED":    "1",
             "MODEL_ID":            str(model_id),
             "ENVIRONMENT":         str(environment),
             "TRIGGERED_BY":        str(triggered_by),
@@ -98,34 +102,63 @@ def trigger_retraining_pipeline(
             "DEPLOYMENT_STRATEGY":   str(prescription.get("deployment_strategy", "canary")),
         })
 
+        # Redirect stdout/stderr into a timestamped, model-tagged log file so
+        # the API + dashboard can tail it. Path goes into the lockfile so the
+        # retrain-status endpoints can find it without filesystem scanning.
+        RETRAIN_LOG_DIR.mkdir(parents=True, exist_ok=True)
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        # Sanitise model_id for the filename — strip non-alphanumeric.
+        safe_model = "".join(c if c.isalnum() else "_" for c in str(model_id))[:64]
+        log_path = RETRAIN_LOG_DIR / f"{ts}-{safe_model}.log"
+
         try:
-            # Launch background process asynchronously
+            log_fh = log_path.open("w", buffering=1)  # line-buffered
+            # Write a header so the consumer can see what triggered the run.
+            log_fh.write(
+                f"# retrain log — model_id={model_id} environment={environment}\n"
+                f"# started_at={datetime.now(timezone.utc).isoformat()} triggered_by={triggered_by}\n"
+                f"# strategy={prescription.get('data_strategy')} window={prescription.get('window_days')}d "
+                f"optimize_for={prescription.get('optimize_for')}\n"
+                f"# severity={severity} reason={reason!r}\n"
+                f"# ─────────────────────────────────────────────────────────────\n"
+            )
+            log_fh.flush()
+
+            # Launch background process; stderr merges into stdout for a single tail target.
             process = subprocess.Popen(
-                [sys.executable, SCRIPT_ABS_PATH],
+                [sys.executable, SCRIPT_PATH],
                 env=local_env,
                 cwd=target_cwd,  # Crucial alignment step
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
+                stdout=log_fh,
+                stderr=subprocess.STDOUT,
             )
 
             # Drop the local process lockfile tracking asset
             lock_payload = {
                 "pid": process.pid,
-                "started_at": Path(SCRIPT_ABS_PATH).stat().st_mtime, # Mock time or use datetime
-                "model_id": model_id
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "model_id": model_id,
+                "log_path": str(log_path),
             }
-            lock_file = Path(LOCKFILE_ABS_PATH)
+            lock_file = Path(LOCKFILE_PATH)
             lock_file.parent.mkdir(parents=True, exist_ok=True)
             lock_file.write_text(json.dumps(lock_payload))
 
-            logger.info(f"[LOCAL MODE] Successfully spawned train.py at PID: {process.pid}")
+            logger.info(
+                "[LOCAL MODE] spawned train.py — pid=%d log=%s",
+                process.pid, log_path,
+            )
             return {
                 "status": "success",
-                "detail": f"LOCAL SUCCESS: Training script spawned in background. PID={process.pid}",
-                "local_pid": process.pid
+                "detail": (
+                    f"LOCAL SUCCESS: Training script spawned in background. "
+                    f"PID={process.pid} log={log_path.name}"
+                ),
+                "local_pid": process.pid,
+                "log_path":  str(log_path),
             }
         except Exception as local_exc:
-            logger.error("[LOCAL MODE] Failed launching local training subprocess: %s", local_exc)
+            logger.info("[LOCAL MODE] Failed launching local training subprocess: %s", local_exc)
             return {"status": "failed", "detail": f"Local process spawn error: {local_exc}"}
 
     # ── 2. CLOUD GITHUB ACTIONS EXECUTION MODE (Original Fallback) ──────────
@@ -211,28 +244,102 @@ def trigger_retraining_pipeline(
         logger.error("trigger_retraining_pipeline failed: %s", exc)
         return {"status": "failed", "detail": str(exc)}
     
+# Max wall-clock age before a held lock is presumed dead and cleaned up.
+# Overridable via env so this can be tuned for long training runs.
+_MAX_LOCK_AGE_SECONDS = int(os.getenv("RETRAIN_LOCK_MAX_AGE_SECONDS", str(2 * 3600)))
+
+
+def _is_zombie(pid: int) -> bool:
+    """
+    Return True iff `pid` is a Linux zombie (state 'Z' in /proc/<pid>/stat).
+
+    `os.kill(pid, 0)` returns success on zombies because the PID is still in
+    the process table — but the process is dead and cannot do anything.
+    """
+    try:
+        stat_line = Path(f"/proc/{pid}/stat").read_text()
+        # Format: pid (comm) state ... — comm may contain spaces/parens, so
+        # parse from the LAST ')' which terminates the comm field.
+        after_comm = stat_line.rsplit(") ", 1)[-1]
+        state = after_comm.split(" ", 1)[0]
+        return state == "Z"
+    except (FileNotFoundError, PermissionError, OSError):
+        return False  # not Linux, or can't read; assume not zombie
+
+
+def _clean_stale_lock(reason: str) -> None:
+    """Remove the lockfile and log why."""
+    logger.info("[LOCAL CHECK] cleaning stale retrain lockfile — %s", reason)
+    Path(LOCKFILE_PATH).unlink(missing_ok=True)
+
+
 def _is_retrain_in_progress() -> bool:
-    """Checks for active local lockfile or cloud workflow status."""
-    if os.getenv("LOCAL_MODE", "false").lower() == "true":
-        lock_file = Path(LOCKFILE_ABS_PATH)
-        if lock_file.exists():
-            try:
-                lock_data = json.loads(lock_file.read_text())
-                pid = lock_data.get("pid")
-                if pid:
-                    os.kill(pid, 0)  # Validates if PID is active in OS
-                    logger.info(f"[LOCAL CHECK] Retrain active. Found process PID: {pid}")
-                    return True
-            except ProcessLookupError:
-                logger.warning(f"[LOCAL CHECK] Stale lockfile found (PID {pid} dead). Cleaning up.")
-                lock_file.unlink(missing_ok=True)
-            except Exception as e:
-                logger.error(f"Error checking local training lockfile: {e}")
-                return True
-        return False
-    
-    else:
+    """
+    Decide whether a retrain is currently active.
+
+    In local mode the lockfile is the source of truth. Several stale states
+    must be detected explicitly — `os.kill(pid, 0)` alone is not enough:
+      • zombie children (Z state) — process is dead but still in the table
+      • lock older than _MAX_LOCK_AGE_SECONDS — assume crashed without cleanup
+      • PID dead (ProcessLookupError) — original case
+    """
+    if os.getenv("LOCAL_MODE", "false").lower() != "true":
         return _is_retrain_in_progress_gh()
+
+    lock_file = Path(LOCKFILE_PATH)
+    if not lock_file.exists():
+        return False
+
+    try:
+        lock_data = json.loads(lock_file.read_text())
+    except Exception as exc:
+        _clean_stale_lock(f"unreadable lockfile ({exc})")
+        return False
+
+    pid = lock_data.get("pid")
+    if not pid:
+        _clean_stale_lock("no pid field")
+        return False
+
+    # 1. Age check — covers crashes that left the lockfile behind even when the
+    #    PID was recycled by an unrelated process.
+    started_at_raw = lock_data.get("started_at")
+    if started_at_raw:
+        try:
+            started = datetime.fromisoformat(started_at_raw)
+            age = (datetime.now(timezone.utc) - started).total_seconds()
+            if age > _MAX_LOCK_AGE_SECONDS:
+                _clean_stale_lock(
+                    f"age {int(age)}s > max {_MAX_LOCK_AGE_SECONDS}s (pid={pid})"
+                )
+                return False
+        except (TypeError, ValueError):
+            # Bad timestamp — don't trust the lock either way; clean it.
+            _clean_stale_lock(f"unparseable started_at={started_at_raw!r}")
+            return False
+
+    # 2. Liveness check.
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        _clean_stale_lock(f"pid {pid} dead")
+        return False
+    except PermissionError:
+        # PID exists but is owned by another user. Can't tell what it is —
+        # safest to treat as active and wait for the age check to age it out.
+        logger.info("[LOCAL CHECK] pid %s owned by another user — treating as active", pid)
+        return True
+    except Exception as exc:
+        logger.info("[LOCAL CHECK] unexpected error checking pid %s: %s — treating as active", pid, exc)
+        return True
+
+    # 3. Zombie check — kill(pid,0) succeeds on zombies. Reap and clean.
+    if _is_zombie(pid):
+        _clean_stale_lock(f"pid {pid} is a zombie (defunct)")
+        return False
+
+    logger.info("[LOCAL CHECK] retrain active — pid=%s started_at=%s", pid, started_at_raw)
+    return True
 
 
 def _is_retrain_in_progress_gh() -> bool:
