@@ -140,13 +140,12 @@ try:
         json={"tool": "get_current_metrics", "params": {}},
         timeout=60,
     ).json()
-    mc1, mc2, mc3, mc4, mc5, mc6 = st.columns(6)
-    mc1.metric("Accuracy",    f"{m.get('accuracy',0):.3f}",    delta=None)
-    mc2.metric("Drift Score", f"{m.get('drift_score',0):.3f}", delta=None)
-    mc3.metric("Latency p95", f"{m.get('latency_ms',0):.0f}ms")
-    mc4.metric("Error Rate",  f"{m.get('error_rate',0):.4f}")
-    mc5.metric("Recall",      f"{m.get('recall',0):.3f}")
-    mc6.metric("ROC-AUC",     f"{m.get('roc_auc',0):.3f}")
+    mc1, mc2, mc3, mc4, mc5 = st.columns(5)
+    mc1.metric("Recall",      f"{m.get('recall',0):.3f}")
+    mc2.metric("ROC-AUC",     f"{m.get('roc_auc',0):.3f}")
+    mc3.metric("Accuracy",    f"{m.get('accuracy',0):.3f}")
+    mc4.metric("Latency p95", f"{m.get('latency_ms',0):.0f}ms")
+    mc5.metric("Error Rate",  f"{m.get('error_rate',0):.4f}")
 
     drift_active = m.get("drift_active", False)
     if drift_active:

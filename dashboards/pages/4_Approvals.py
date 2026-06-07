@@ -5,10 +5,20 @@ Human-in-the-loop approvals — list paused major-severity runs, approve or reje
 Auto-refreshes every 5s when there are pending approvals.
 """
 
+import html
 import time
 import streamlit as st
 import requests
 from utils.session import init_session
+
+
+def esc(s) -> str:
+    """HTML-escape any value safely (None → '—'). Prevents LLM-produced text
+    with '<', '&', triple backticks, etc. from breaking the surrounding HTML
+    block — which used to cause raw HTML to render as a code box."""
+    if s is None:
+        return "—"
+    return html.escape(str(s))
 
 init_session()
 
@@ -107,22 +117,22 @@ else:
             <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin-bottom:16px;">
                 <div style="background:#0d0f14;border:1px solid #1f2330;border-radius:6px;padding:12px;">
                     <div style="font-size:0.62rem;color:#555c72;letter-spacing:0.12em;">MODEL</div>
-                    <div style="font-size:0.85rem;color:#e8eaf0;margin-top:4px;">{model_id}</div>
+                    <div style="font-size:0.85rem;color:#e8eaf0;margin-top:4px;">{esc(model_id)}</div>
                 </div>
                 <div style="background:#0d0f14;border:1px solid #1f2330;border-radius:6px;padding:12px;">
                     <div style="font-size:0.62rem;color:#555c72;letter-spacing:0.12em;">ENVIRONMENT</div>
-                    <div style="font-size:0.85rem;color:#e8eaf0;margin-top:4px;">{env}</div>
+                    <div style="font-size:0.85rem;color:#e8eaf0;margin-top:4px;">{esc(env)}</div>
                 </div>
                 <div style="background:#0d0f14;border:1px solid #1f2330;border-radius:6px;padding:12px;">
                     <div style="font-size:0.62rem;color:#555c72;letter-spacing:0.12em;">PROPOSED ACTION</div>
-                    <div style="font-size:0.85rem;color:#00d4ff;margin-top:4px;font-weight:600;">{action}</div>
+                    <div style="font-size:0.85rem;color:#00d4ff;margin-top:4px;font-weight:600;">{esc(action)}</div>
                 </div>
             </div>
 
             <div style="background:#0d0f14;border:1px solid #1f2330;border-radius:6px;
                         padding:14px 16px;margin-bottom:16px;">
                 <div style="font-size:0.62rem;color:#555c72;letter-spacing:0.12em;margin-bottom:8px;">ROOT CAUSE DIAGNOSIS</div>
-                <div style="font-size:0.82rem;color:#8b91a8;line-height:1.7;">{diagnosis}</div>
+                <div style="font-size:0.82rem;color:#8b91a8;line-height:1.7;">{esc(diagnosis)}</div>
             </div>
         </div>
         """, unsafe_allow_html=True)
@@ -143,7 +153,7 @@ else:
                     {"<span style='float:right;color:#9b59ff;'>confidence: "+str(confidence)+"</span>" if confidence else ""}
                     {"<span style='margin-left:8px;color:#00d4ff;font-size:0.65rem;'>"+root_cat+"</span>" if root_cat else ""}
                 </div>
-                {"".join(f'<div style="font-size:0.78rem;color:#8b91a8;padding:3px 0;line-height:1.6;">· {e}</div>' for e in evidence)}
+                {"".join(f'<div style="font-size:0.78rem;color:#8b91a8;padding:3px 0;line-height:1.6;">· {esc(e)}</div>' for e in evidence)}
             </div>
             """, unsafe_allow_html=True)
 
@@ -152,7 +162,7 @@ else:
             <div style="background:#0d0f14;border:1px solid #1f2330;border-radius:6px;
                         padding:14px 16px;margin-bottom:12px;">
                 <div style="font-size:0.62rem;color:#555c72;letter-spacing:0.12em;margin-bottom:8px;">REASONING CHAIN</div>
-                <div style="font-size:0.82rem;color:#8b91a8;line-height:1.7;">{reasoning}</div>
+                <div style="font-size:0.82rem;color:#8b91a8;line-height:1.7;">{esc(reasoning)}</div>
             </div>
             """, unsafe_allow_html=True)
 
@@ -165,16 +175,16 @@ else:
                 <div style="font-size:0.62rem;color:#555c72;letter-spacing:0.12em;margin-bottom:8px;">PROPOSED PRESCRIPTION</div>
                 <div style="display:flex;flex-wrap:wrap;gap:8px;font-size:0.75rem;">
                     <span style="background:#1a1d26;color:#00d4ff;padding:4px 10px;border-radius:3px;">
-                        strategy: {prescription.get('data_strategy','—')}
+                        strategy: {esc(prescription.get('data_strategy','—'))}
                     </span>
                     <span style="background:#1a1d26;color:#e8eaf0;padding:4px 10px;border-radius:3px;">
-                        window: {prescription.get('window_days','—')}d
+                        window: {esc(prescription.get('window_days','—'))}d
                     </span>
                     <span style="background:#1a1d26;color:#9b59ff;padding:4px 10px;border-radius:3px;">
-                        optimize: {prescription.get('optimize_for','—')}
+                        optimize: {esc(prescription.get('optimize_for','—'))}
                     </span>
                     <span style="background:#1a1d26;color:#00e5a0;padding:4px 10px;border-radius:3px;">
-                        deploy: {prescription.get('deployment_strategy','—')}
+                        deploy: {esc(prescription.get('deployment_strategy','—'))}
                     </span>
                 </div>
             </div>
@@ -205,8 +215,8 @@ else:
                     st.markdown(f"""
                     <div style="display:flex;gap:12px;padding:6px 0;border-bottom:1px solid #13161e;
                                 font-family:'JetBrains Mono',monospace;font-size:0.73rem;">
-                        <div style="min-width:90px;color:{tag_color};">[{agent_tag}]</div>
-                        <div style="color:#8b91a8;">{content}</div>
+                        <div style="min-width:90px;color:{tag_color};">[{esc(agent_tag)}]</div>
+                        <div style="color:#8b91a8;">{esc(content)}</div>
                     </div>
                     """, unsafe_allow_html=True)
 

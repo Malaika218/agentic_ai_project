@@ -365,15 +365,16 @@ if metrics_ok:
             ● Live — {sample_size} real predictions &nbsp;·&nbsp; dataset: {active_label}
         </div>""", unsafe_allow_html=True)
 
-    mc1, mc2, mc3, mc4 = st.columns(4)
+    mc1, mc2, mc3, mc4, mc5 = st.columns(5)
     stale = " *" if sample_size < 10 else ""
     for col, (lbl, val, color, fmt) in zip(
-        [mc1, mc2, mc3, mc4],
+        [mc1, mc2, mc3, mc4, mc5],
         [
-            ("Drift Score (PSI)" + stale, m.get("drift_score", 0),  "#ff4560", "{:.4f}"),
-            ("Accuracy Proxy" + stale,    m.get("accuracy", 0),     "#00d4ff", "{:.4f}"),
-            ("Latency p95" + stale,       m.get("latency_ms", 0),   "#00e5a0", "{:.1f}ms"),
-            ("Error Rate" + stale,        m.get("error_rate", 0),   "#ffb800", "{:.4f}"),
+            ("Recall" + stale,        m.get("recall", 0),      "#ff4560", "{:.4f}"),
+            ("ROC-AUC" + stale,       m.get("roc_auc", 0),     "#9b59ff", "{:.4f}"),
+            ("Accuracy" + stale,      m.get("accuracy", 0),    "#00d4ff", "{:.4f}"),
+            ("Latency p95" + stale,   m.get("latency_ms", 0),  "#00e5a0", "{:.1f}ms"),
+            ("Error Rate" + stale,    m.get("error_rate", 0),  "#ffb800", "{:.4f}"),
         ]
     ):
         disp = f"{val:.1f}ms" if "ms" in fmt else fmt.format(val)
@@ -389,8 +390,8 @@ if metrics_ok:
 
     st.markdown(
         f'<div style="margin-top:8px;font-family:\'JetBrains Mono\',monospace;font-size:0.7rem;color:#555c72;">'
-        f'recall: {m.get("recall",0):.4f} &nbsp;·&nbsp; roc_auc: {m.get("roc_auc",0):.4f}'
-        f' &nbsp;·&nbsp; fraud_rate: {m.get("fraud_rate",0):.4f}'
+        f'fraud_rate: {m.get("fraud_rate",0):.4f}'
+        f' &nbsp;·&nbsp; precision: {m.get("precision",0):.4f}'
         f' &nbsp;·&nbsp; n={sample_size}</div>',
         unsafe_allow_html=True,
     )
