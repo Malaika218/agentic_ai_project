@@ -1,317 +1,229 @@
-# 🤖 Multi-Agent MLOps Monitoring & Autonomous Remediation System
+# Agentic MLOps — Self-Healing Fraud Detection
 
-A production-grade, agentic AI pipeline that **monitors deployed ML models, diagnoses degradation, autonomously remediates, and learns from every incident** — powered by LangGraph, Ollama, and ChromaDB.
+A production-style MLOps demo where deployed models **monitor themselves, diagnose drift, get human-approved on critical incidents, retrain, and hot-swap** — fully autonomous within guardrails. Built on LangGraph, MLflow, ChromaDB, with pluggable LLM backends (Ollama local / Google Gemini).
 
----
-
-## How It Works
-
-```
-[Monitor Agent] → route_by_severity
-    ├── "none"     → END  (healthy, nothing to do)
-    ├── "minor"    → [Diagnosis] → [Remediation] → [Reporting] → END
-    ├── "critical" → [Diagnosis] → [Remediation] → [Reporting] → END
-    └── "major"    → [Diagnosis] → [Human Approval] → [Remediation] → [Reporting] → END
-```
-
-Each run saves the incident to ChromaDB. Future diagnosis queries retrieve similar past incidents, runbooks, and metrics trends — making the system **progressively smarter over time**.
+For the full architecture, components, state stores, and both healthy + remediation flows, see [`ARCHITECTURE.md`](./ARCHITECTURE.md).
 
 ---
 
-## Project Structure
+## The self-healing loop
 
 ```
-mlops_agents/
-├── main.py                        # Entry point — CLI for run / resume / init
-├── state.py                       # Shared LangGraph AgentState TypedDict
-├── requirements.txt
-├── .env.example                   # All configuration options (copy to .env)
-│
-├── agents/
-│   ├── monitor_agent.py           # Fetches real-time metrics, classifies severity
-│   ├── diagnosis_agent.py         # RAG-enriched LLM root cause analysis
-│   ├── remediation_agent.py       # Dispatches retrain / rollback / scale / investigate
-│   └── reporting_agent.py         # Generates report, saves to RAG, sends notifications
-│
-├── graph/
-│   └── workflow.py                # LangGraph StateGraph + conditional routing
-│
-├── rag/
-│   ├── store.py                   # ChromaDB RAG store (3 collections)
-│   └── init_collections.py        # One-time schema initialisation script
-│
-├── tools/
-│   ├── metrics_source.py          # Prometheus / Azure Monitor / MLflow adapters
-│   └── mcp_tools.py               # GitHub Actions, Kubernetes, Helm, Slack, email
-│
-└── scripts/
-    └── ingest_runbooks.py         # Offline bulk-ingest runbooks into ChromaDB
+   Generator ──▶ Model Server ◀── Watcher (MLflow polling)
+       │              │                   ▲
+       │              ▼                   │ new model + scalers
+       │           Telemetry              │
+       │              │                   │
+       ▼              ▼                   │
+   Real metrics + labels in window        │
+       │                                  │
+       ▼                                  │
+   Monitor Agent ──▶ (none) ──▶ END       │
+       │                                  │
+       ▼ (minor/major/critical)           │
+   Diagnosis Agent ──▶ Histogram-Drift    │
+       │                                  │
+       ▼ (critical/major)                 │
+   Human Approval (HITL interrupt)        │
+       │                                  │
+       ▼ (approved)                       │
+   Remediation ──▶ train.py subprocess ───┘
+       │
+       ▼
+   Reporting ──▶ ChromaDB + threshold-manager
 ```
+
+| Severity | Routing | What runs |
+|---|---|---|
+| `none`  | Monitor → END | Pipeline exits early |
+| `minor` | Monitor → Diagnosis → Remediation → Reporting → END | No HITL |
+| `major` / `critical` | Monitor → Diagnosis → **HITL** → Remediation → Reporting → END | Paused at human approval |
+
+Every run persists to ChromaDB. Future diagnoses retrieve similar past incidents, runbooks, and metrics trends.
+
+---
+
+## Quickstart
+
+One command launches everything:
+
+```bash
+git clone <repo-url> agentic_mlops && cd agentic_mlops
+cp .env.example .env  # if you don't have one yet — see "Configuration" below
+./setup.sh
+```
+
+`./setup.sh` does in order:
+
+1. Creates/verifies `.venv` and runs `pip install -r requirements.txt`
+2. Loads `.env` (safe parser — tolerates comments, quoted values, whitespace)
+3. Validates `LLM_PROVIDER` (`ollama` default, `google` requires `GOOGLE_API_KEY`)
+4. Pings Ollama and pulls `llama3.2:1b` + `nomic-embed-text` if missing
+5. Verifies `mlops_agents/data/creditcard.csv` exists (instructs you on the `kaggle` download if not)
+6. Detects your terminal emulator and launches three services in separate windows:
+   - **Model Server** on `:8080`
+   - **FastAPI** on `:8000`
+   - **Streamlit Dashboard** on `:8501`
+
+Flags:
+
+```bash
+./setup.sh --check          # preflight only — no launch
+./setup.sh --no-install     # skip pip install (faster reruns)
+./setup.sh --no-pull        # skip Ollama model pulls
+./setup.sh --terminal=tmux  # force tmux instead of GUI emulator
+```
+
+Open `http://localhost:8501` to drive the system.
 
 ---
 
 ## Prerequisites
 
 | Tool | Version | Purpose |
-|------|---------|---------|
-| Python | ≥ 3.10 | Runtime |
-| Ollama | Latest | Local LLM inference |
-| `llama3.2:1b` model | — | Pulled via Ollama |
-| `nomic-embed-text` model | — | Pulled via Ollama |
-| kubectl + helm | Latest | For remediation tools (optional for dev) |
+|---|---|---|
+| Python | ≥ 3.10 (3.12 tested) | Runtime |
+| Ollama | latest | Local LLM inference (skip if using Gemini) |
+| `creditcard.csv` | Kaggle `mlg-ulb/creditcardfraud` | Training dataset |
+| Databricks MLflow workspace | optional | Default tracking backend |
+| `kubectl` / `helm` | latest | Only if you wire up rollback / scale tools |
+
+### Dataset
+
+The trainer and scenario generators need the Kaggle dataset at `mlops_agents/data/creditcard.csv`. Download it once:
+
+```bash
+kaggle datasets download mlg-ulb/creditcardfraud -p ./mlops_agents/data/ --unzip
+```
+
+`./setup.sh` checks for the file and refuses to launch services until it's present.
 
 ---
 
-## Quickstart
+## Configuration
 
-### 1. Clone & set up the environment
-
-```bash
-git clone https://github.com/your-org/mlops_agents.git
-cd mlops_agents
-
-python -m venv venv
-source venv/bin/activate          # Windows: venv\Scripts\activate
-
-pip install -r requirements.txt
-```
-
-### 2. Install and start Ollama
-
-```bash
-# Linux / Mac
-curl -fsSL https://ollama.com/install.sh | sh
-
-# Windows — download installer from https://ollama.com
-
-# Pull the required models
-ollama pull llama3.2:1b
-ollama pull nomic-embed-text
-```
-
-### 3. Configure environment
-
-```bash
-cp .env.example .env
-```
-
-Open `.env` and fill in at minimum:
+Everything is `.env`-driven. Key vars:
 
 ```env
-# Which metrics source to use
-METRICS_SOURCE=prometheus          # or: azure | mlflow
+# LLM backend — switch with one line
+LLM_PROVIDER=ollama                  # ollama | google
 
-# The model you want to monitor
-DEFAULT_MODEL_ID=your-model-name
+# Ollama (when LLM_PROVIDER=ollama)
+OLLAMA_BASE_URL=http://localhost:11434
+OLLAMA_MODEL=llama3.2:1b
+OLLAMA_EMBED_MODEL=nomic-embed-text
+
+# Google Gemini (when LLM_PROVIDER=google)
+GOOGLE_API_KEY=...
+GOOGLE_MODEL=gemini-2.0-flash
+
+# Model identity
+DEFAULT_MODEL_ID=main.default.fraud_classifier_v1
 DEFAULT_ENVIRONMENT=production
 
-# Prometheus (if METRICS_SOURCE=prometheus)
-PROMETHEUS_URL=http://localhost:9090
+# MLflow / Databricks Unity Catalog
+MLFLOW_TRACKING_URI=https://<workspace>.cloud.databricks.com
+MLFLOW_TRACKING_TOKEN=...
+MLFLOW_EXPERIMENT_NAME=/Shared/fraud-detection
 
-# GitHub (needed for retrain + investigate actions)
-GITHUB_TOKEN=ghp_xxxxxxxxxxxx
-GITHUB_OWNER=your-org
-GITHUB_REPO=your-repo
-GITHUB_RETRAIN_WORKFLOW_ID=retrain.yml
+# Behaviour flags
+LOCAL_MODE=true                      # spawn train.py locally vs. dispatch GitHub Actions
+HUMAN_IN_THE_LOOP=true               # dynamic interrupt() in workflow
+DRY_RUN=false
 
-# Kubernetes (needed for rollback + scale actions)
-K8S_NAMESPACE=ml-production
-
-# Slack notifications
-SLACK_WEBHOOK_URL=https://hooks.slack.com/services/...
-
-# Email alerts
-SMTP_HOST=smtp.yourdomain.com
-SMTP_USER=alerts@yourdomain.com
-SMTP_PASSWORD=your-password
-EMAIL_FROM=alerts@yourdomain.com
-EMAIL_TO_CRITICAL=oncall@yourdomain.com
-EMAIL_TO_MAJOR=ml-team@yourdomain.com
-```
-
-> All other fields have sensible defaults. See `.env.example` for the full list.
-
-### 4. Initialise ChromaDB collections
-
-```bash
-python main.py init
-```
-
-This creates the three ChromaDB collections (`incidents`, `metrics_history`, `runbooks`) in `./rag_data/`. Safe to re-run — it is idempotent.
-
-### 5. (Optional) Ingest runbooks
-
-```bash
-# Ingest all .md / .txt files from a directory
-python scripts/ingest_runbooks.py --dir ./docs/runbooks
-
-# Ingest from a JSON manifest
-python scripts/ingest_runbooks.py --manifest ./docs/runbooks.json
-
-# Ingest a single file
-python scripts/ingest_runbooks.py --file ./docs/retrain-runbook.md \
-    --title "Retraining Runbook" --doc-type runbook --tags "retrain,drift"
-```
-
-### 6. Run the pipeline
-
-```bash
-python main.py run --model-id your-model-name --environment production
-```
-
----
-
-## All CLI Commands
-
-```bash
-# Initialise ChromaDB collections (run once)
-python main.py init
-
-# Run a full monitoring cycle
-python main.py run --model-id <model-id> --environment <production|staging|canary>
-
-# Run with a specific thread ID (for tracking / resuming)
-python main.py run --model-id fraud-classifier-v2 --thread-id my-thread-123
-
-# Resume a pipeline paused at human approval (major severity)
-python main.py resume --thread-id <thread-id> --approve
-python main.py resume --thread-id <thread-id> --reject
-
-# Skip the Ollama connectivity check (useful in CI)
-python main.py run --model-id fraud-classifier-v2 --skip-connectivity-check
-```
-
----
-
-## Metrics Sources
-
-Set `METRICS_SOURCE` in `.env` to one of the following:
-
-### `prometheus` (default)
-
-```env
-METRICS_SOURCE=prometheus
-PROMETHEUS_URL=http://prometheus.monitoring.svc.cluster.local:9090
-PROMETHEUS_BEARER_TOKEN=           # optional
-```
-
-Your Prometheus instance must expose these metrics from your ML serving layer:
-
-```
-mlops_model_accuracy{model_id="...", environment="..."}
-mlops_model_drift_score{...}
-mlops_request_latency_seconds_bucket{...}   # histogram
-mlops_request_errors_total{...}
-mlops_predictions_total{...}
-```
-
-### `azure`
-
-```env
-METRICS_SOURCE=azure
-AZURE_TENANT_ID=...
-AZURE_CLIENT_ID=...
-AZURE_CLIENT_SECRET=...
-AZURE_SUBSCRIPTION_ID=...
-AZURE_RESOURCE_GROUP=...
-AZURE_MONITOR_WORKSPACE_ID=...
-AZURE_ML_WORKSPACE_NAME=...
-```
-
-Install the extra dependencies:
-
-```bash
-pip install azure-identity azure-monitor-query azure-ai-ml
-```
-
-### `mlflow`
-
-```env
-METRICS_SOURCE=mlflow
-MLFLOW_TRACKING_URI=http://mlflow.svc:5000
-MLFLOW_EXPERIMENT_NAME=production-model-evals
-```
-
-Install the extra dependency:
-
-```bash
-pip install mlflow
-```
-
----
-
-## Remediation Actions
-
-| Action | When triggered | What it does |
-|--------|---------------|--------------|
-| `retrain` | High drift / stale model | Dispatches GitHub Actions `workflow_dispatch` |
-| `rollback` | Recent deployment regression | Runs `helm rollback` via subprocess |
-| `scale` | Latency spike, accuracy healthy | Scales Kubernetes deployment replicas |
-| `investigate` | Ambiguous root cause | Opens a GitHub Issue with full context |
-
----
-
-## Severity Thresholds
-
-All thresholds are configurable via `.env` — no code changes needed:
-
-```env
-THRESHOLD_ACCURACY_CRITICAL=0.65
+# Severity thresholds (deterministic floor — adaptive layer tunes from here)
 THRESHOLD_ACCURACY_MAJOR=0.72
-THRESHOLD_ACCURACY_MINOR=0.80
-THRESHOLD_DRIFT_CRITICAL=0.60
-THRESHOLD_DRIFT_MAJOR=0.35
-THRESHOLD_DRIFT_MINOR=0.20
-THRESHOLD_LATENCY_CRITICAL_MS=2000
+THRESHOLD_ACCURACY_CRITICAL=0.65
+THRESHOLD_RECALL_MAJOR=0.75
+THRESHOLD_RECALL_CRITICAL=0.60
+THRESHOLD_ROC_AUC_MAJOR=0.85
+THRESHOLD_ROC_AUC_CRITICAL=0.75
 THRESHOLD_LATENCY_MAJOR_MS=1000
-THRESHOLD_ERROR_RATE_CRITICAL=0.10
+THRESHOLD_LATENCY_CRITICAL_MS=2000
 THRESHOLD_ERROR_RATE_MAJOR=0.05
-```
+THRESHOLD_ERROR_RATE_CRITICAL=0.10
 
-Grey-zone cases (between thresholds) are automatically escalated to the LLM for classification.
+# Trainer
+MIN_PRECISION=0.10                   # precision floor for the threshold tuner
+RETRAIN_LOCK_MAX_AGE_SECONDS=7200    # zombie-lock guard
 
----
+# Optional cost overrides (per 1M tokens, USD)
+# LLM_COST_GEMINI_2_0_FLASH_INPUT=0.10
+# LLM_COST_GEMINI_2_0_FLASH_OUTPUT=0.40
 
-## Human-in-the-Loop
-
-For **major** severity incidents, the pipeline pauses before executing remediation:
-
-```
-[Diagnosis] → ⏸ PAUSED — human approval required → [Remediation]
-```
-
-You will see in the terminal:
-
-```
-Pipeline paused at human approval checkpoint.
-Thread ID: abc-123
-Resume with: python main.py resume --thread-id abc-123 --approve
-```
-
-Then either approve or reject:
-
-```bash
-python main.py resume --thread-id abc-123 --approve   # proceed with remediation
-python main.py resume --thread-id abc-123 --reject    # cancel, end pipeline
-```
-
-To disable human approval (auto-approve all major incidents):
-
-```env
-HUMAN_IN_THE_LOOP=false
+# Optional notifications
+SLACK_NOTIFICATIONS_ENABLED=false
+EMAIL_NOTIFICATIONS_ENABLED=false
+EMAIL_MIN_SEVERITY=major
 ```
 
 ---
 
-## ChromaDB RAG Collections
+## Dashboard tour
 
-| Collection | Contents | Queried by |
-|------------|----------|-----------|
-| `incidents` | Full incident records — metrics, diagnosis, remediation outcome, report | Diagnosis Agent |
-| `metrics_history` | Lightweight metric snapshots from every monitor cycle | Monitor Agent, Diagnosis Agent |
-| `runbooks` | Runbooks, post-mortems, playbooks ingested offline | Diagnosis Agent |
+The Streamlit dashboard at `:8501` is the operator UI.
 
-ChromaDB persists to `./rag_data/` by default. To use a remote ChromaDB server:
+| Page | Purpose |
+|---|---|
+| **Overview** | Trigger pipeline runs, see live model metrics, watch the active run unfold (status / severity / current agent), browse run history with per-run **token + cost totals**, view streaming training logs while retraining is in flight |
+| **Incidents** | Browse the ChromaDB incident archive |
+| **Approvals** | Approve or reject paused (critical-severity) runs — drives the LangGraph `interrupt()` resume |
+| **Runbooks** | Add new runbooks for the RAG store |
+| **Drift Lab** | Activate one of the scenario CSVs (`baseline` / `concept_drift` / `data_drift_amount` / …), start/stop the transaction generator at a chosen rate, watch live drift signals |
+
+---
+
+## Three-server architecture
+
+| Service | Port | What it does | Hot-reload |
+|---|---|---|---|
+| **Model Server** (`fraud_model_server/model_server/server.py`) | 8080 | Serves `/predict`, captures predictions + labels in a 5K sliding window, computes live metrics, polls MLflow every 60s for new retrains and atomically swaps model + scalers + metadata + clears the deque | ✓ |
+| **FastAPI Orchestrator** (`api/main.py`) | 8000 | HTTP wrapper around the LangGraph pipeline; manages run lifecycle, approvals, generator subprocess, retrain log tailing | — |
+| **Streamlit Dashboard** (`dashboards/app.py`) | 8501 | Operator UI, polls the API | — |
+
+The LangGraph workflow lives inside the FastAPI process. Each run is a checkpointed thread; HITL pauses are handled by `langgraph.types.interrupt()` and resumed via `Command(resume=True/False)`.
+
+---
+
+## Agents and tools
+
+| Agent | Role | Determinism strategy |
+|---|---|---|
+| **Monitor** | Classify severity, narrate the breach | `severity_classifier` tool computes severity deterministically from metrics + thresholds; LLM only writes the human-readable reasoning |
+| **Diagnosis** | Find root cause, prescribe retrain parameters | `histogram_drift` tool computes per-feature PSI / KS / mean-shift in NumPy; LLM consumes a structured summary, not raw histograms |
+| **Remediation** | Dispatch action (retrain / rollback / scale / investigate) | Pure Python action dispatcher; subprocess management with zombie + age guards |
+| **Reporting** | Generate report, persist incident, adapt thresholds | Threshold adaptation has a precision floor and bounded clamping |
+| **Threshold Manager** | LLM-proposed threshold deltas, bounded + validated | Pydantic ±delta validation rejects out-of-bounds; clamping prevents drift into nonsense ranges |
+
+Per-agent LLM token usage and cost are tracked via `mlops_agents/tools/token_tracker.py` (a LangChain `BaseCallbackHandler`) and displayed on the Overview page.
+
+---
+
+## Retraining
+
+When the diagnosis agent prescribes `retrain` and a human approves:
+
+1. The remediation agent spawns `train.py` as a subprocess via `mcp_tools.trigger_retraining_pipeline`. Stdout/stderr stream to `data/logs/retrain/<ts>-<model>.log` (unbuffered).
+2. The dashboard's Overview page tails that log in a code panel while the process is alive (live indicator + auto-refresh).
+3. `train.py` refits scalers if requested, fits a SMOTE-balanced LogisticRegression, tunes the decision threshold with a precision floor (default `MIN_PRECISION=0.10`) and F2 fallback if the precision floor + recall target are jointly unachievable. Result: never deploys a "predict-everything-as-fraud" model.
+4. The new version is registered in MLflow, `champion` alias is promoted automatically.
+5. Model Server's watcher detects the new run within 60s, atomically swaps model + both scalers + metadata, and clears the prediction window so subsequent metrics reflect the new model only.
+
+Retraining lockfile has stale-detection guards: zombies, age > `RETRAIN_LOCK_MAX_AGE_SECONDS` (default 2h), unparseable timestamps, corrupt JSON — all self-heal.
+
+---
+
+## ChromaDB collections
+
+| Collection | Holds | Read by |
+|---|---|---|
+| `incidents` | Full incident records (metrics, diagnosis, remediation, report) | Diagnosis Agent |
+| `runs` | Pipeline runs with status, severity, prescription, token usage | FastAPI orchestrator |
+| `runbooks` | Runbooks / playbooks ingested offline | Diagnosis Agent |
+| `metrics_history` | Periodic metrics snapshots for trend detection | Monitor Agent, threshold manager |
+| `dynamic_thresholds` | Adapted severity thresholds per model | Monitor Agent |
+
+Default persists to `./rag_data/`. To use a remote ChromaDB:
 
 ```env
 CHROMA_HOST=chroma.internal.yourdomain.com
@@ -320,86 +232,95 @@ CHROMA_PORT=8000
 
 ---
 
-## Notifications
+## Drift scenarios
 
-**Slack** — configure one of:
+Pre-built CSVs in `mlops_agents/data/datasets/` exercise different drift modes:
 
-```env
-# Option A: Incoming Webhook (simpler)
-SLACK_WEBHOOK_URL=https://hooks.slack.com/services/XXX/YYY/ZZZ
+| Scenario | What changes vs. baseline | Expected severity |
+|---|---|---|
+| `baseline` | Nothing — original distribution | `none` |
+| `concept_drift` | Label-to-feature relationship shifts | `critical` (recall + roc_auc collapse) |
+| `data_drift_amount` | `Amount` feature distribution shifts | `major` / `critical` depending on window |
+| `mixed` | Both | `critical` |
 
-# Option B: Bot Token with per-severity channel routing
-SLACK_BOT_TOKEN=xoxb-xxxxxxxxxxxx
-SLACK_SEVERITY_CHANNELS={"critical":"#incidents","major":"#mlops-alerts"}
+Drift Lab → click "Activate" on a scenario → start the generator → trigger a monitor run from Overview → watch the loop fire.
+
+---
+
+## CLI fallback (legacy)
+
+The dashboard is the primary interface, but `main.py` still supports headless CLI flows:
+
+```bash
+python main.py init                              # one-time ChromaDB init
+python main.py run --model-id <id> --environment production
+python main.py resume --thread-id <id> --approve
 ```
 
-**Email** — configure SMTP or SendGrid:
-
-```env
-# SMTP (default)
-ALERT_EMAIL_PROVIDER=smtp
-SMTP_HOST=smtp.yourdomain.com
-SMTP_PORT=587
-SMTP_USER=alerts@yourdomain.com
-SMTP_PASSWORD=...
-
-# SendGrid
-ALERT_EMAIL_PROVIDER=sendgrid
-SENDGRID_API_KEY=SG.xxxxxxxxxxxxx
-```
-
-Set the minimum severity that triggers emails (default: `major`):
-
-```env
-EMAIL_MIN_SEVERITY=major    # emails sent for major + critical only
-```
+These bypass the dashboard but use the same LangGraph workflow.
 
 ---
 
 ## Troubleshooting
 
-**`Cannot reach Ollama`**
+**Ollama not reachable**
 ```bash
-# Make sure Ollama is running
-ollama serve
-
-# Verify the model is pulled
-ollama list
+ollama serve   # or: systemctl --user start ollama
+ollama list    # confirm llama3.2:1b and nomic-embed-text are present
 ```
 
-**`MetricsSourceError`**
-- Check your `METRICS_SOURCE` env var is set correctly
-- Verify the endpoint is reachable from your machine
-- For Prometheus: confirm your ML serving layer is exporting the expected metric names
-
-**`ChromaDB collection not found`**
+**`creditcard.csv NOT FOUND`**
 ```bash
-# Re-run the init script
-python main.py init
+kaggle datasets download mlg-ulb/creditcardfraud -p ./mlops_agents/data/ --unzip
 ```
 
-**`ModuleNotFoundError`**
+**`numpy.ufunc has no attribute __module__` during model load**
+NumPy/SciPy version skew. Confirm `numpy<2.3` in `requirements.txt`, reinstall venv:
 ```bash
-# Make sure you activated your virtualenv
-source venv/bin/activate
-pip install -r requirements.txt
+.venv/bin/pip install -r requirements.txt --upgrade
 ```
 
-**Pipeline paused unexpectedly**
-- This is expected for `major` severity — see [Human-in-the-Loop](#human-in-the-loop) above
-- Use `python main.py resume --thread-id <id> --approve` to continue
+**Retrain stuck — lockfile shows zombie PID**
+The new staleness guard handles this automatically on the next retrain attempt. To force-clear:
+```bash
+rm fraud_model_server/model_server/model/.retrain.lock
+```
+
+**Streamlit warning: "widget created with default value but also set via session state"**
+Already fixed in Drift Lab and Overview pages. If you see it elsewhere, the pattern is: drop the `index=` arg from selectboxes that drive session_state from the API.
+
+**MLflow run shows "Run already active" tracebacks**
+Telemetry Worker collision with metrics-snapshot run — fixed in `server.py`. The worker now uses `client.log_artifact(run_id=...)` directly instead of opening a new active run.
+
+**Model server reports `version 17` but metrics look like `v16`**
+Sliding window still has pre-swap records. After my fixes the deque is cleared on swap; this only happens for old runs predating that change. Wait for the window to refill or restart the model server.
 
 ---
 
-## Tech Stack
+## Tech stack
 
-| Component | Technology |
-|-----------|-----------|
-| Agent Orchestration | LangGraph (StateGraph, MemorySaver, GraphInterrupt) |
-| LLM Inference | Ollama — `llama3.2:1b` (INT4, ~2 GB) |
-| Embeddings | `nomic-embed-text` via Ollama |
-| Vector Database | ChromaDB (local PersistentClient or remote HttpClient) |
-| Metrics Sources | Prometheus, Azure Monitor, MLflow |
-| Remediation Tools | Kubernetes Python client, Helm CLI, GitHub REST API v3 |
-| Notifications | Slack Blocks API, SMTP, SendGrid |
-| Deployment | Docker, Helm, Azure Kubernetes Service (AKS) |
+| Component | Tech |
+|---|---|
+| Agent orchestration | LangGraph (StateGraph, MemorySaver, dynamic `interrupt()`) |
+| LLM | Ollama (`llama3.2:1b`) or Google Gemini, pluggable via `LLM_PROVIDER` |
+| Embeddings | `nomic-embed-text` via Ollama / Gemini embeddings |
+| Vector DB | ChromaDB (PersistentClient or HttpClient) |
+| Model | scikit-learn LogisticRegression, SMOTE-balanced |
+| Model registry | MLflow / Databricks Unity Catalog |
+| Drift detection | NumPy PSI / KS / mean-shift (deterministic; no LLM in the math path) |
+| Token tracking | LangChain `BaseCallbackHandler` (provider-agnostic counts, model-specific cost lookup) |
+| API | FastAPI + uvicorn |
+| Dashboard | Streamlit |
+| Notifications | Slack webhooks, SMTP, SendGrid (all optional) |
+
+---
+
+## Further reading
+
+- [`ARCHITECTURE.md`](./ARCHITECTURE.md) — full component / state-store / flow reference for the architecture diagram
+- `mlops_agents/agents/*.py` — agent implementations
+- `mlops_agents/tools/severity_classifier.py` — deterministic severity rules
+- `mlops_agents/tools/histogram_drift.py` — PSI / KS computation
+- `mlops_agents/tools/token_tracker.py` — token + cost callback
+- `fraud_model_server/model_server/server.py` — serving + hot-reload + telemetry
+- `fraud_model_server/model_server/scripts/train.py` — trainer with precision-floor threshold tuner
