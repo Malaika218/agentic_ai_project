@@ -57,6 +57,8 @@ PROJECT_ROOT     = Path(__file__).parent.parent
 DATASETS_DIR     = PROJECT_ROOT / "mlops_agents" / "data" / "datasets"
 SCRIPTS_DIR = PROJECT_ROOT / "mlops_agents" / "scripts"
 ACTIVE_DATASET_FILE = PROJECT_ROOT / "mlops_agents" / "data" / "active_dataset.json"
+RETRAIN_LOG_DIR  = PROJECT_ROOT / "data" / "logs" / "retrain"
+RETRAIN_LOCK     = PROJECT_ROOT / "fraud_model_server" / "model_server" / "model" / ".retrain.lock"
 
 def _stop_generator_process() -> dict[str, Any]:
     """Stop the generator subprocess using the same logic as the HTTP endpoint."""
@@ -118,7 +120,7 @@ _generator_state: dict[str, Any] = {
 # ── pydantic models ───────────────────────────────────────────────────────────
 
 class RunRequest(BaseModel):
-    model_id:    str = os.getenv("DEFAULT_MODEL_ID", "fraud-classifier-v1")
+    model_id:    str = os.getenv("DEFAULT_MODEL_ID", "main.default.fraud_classifier_v1")
     environment: str = "production"
 
 
@@ -137,116 +139,144 @@ def _build_graph():
     return build_graph(rag=rag)
 
 
+def _apply_node_output(thread_id: str, node_name: str, node_out: dict) -> None:
+    """Merge a node's output dict into the cached run record."""
+    runs[thread_id]["current_agent"] = node_name
+    for field in (
+        "severity", "diagnosis", "recommended_action", "remediation_status",
+        "incident_id", "report", "remediation_action", "remediation_detail",
+        "diagnosis_json", "retrain_prescription", "drifted_features",
+        "similar_incidents", "relevant_runbooks", "notifications_sent",
+        "human_approved", "postmortem_runbook_id",
+    ):
+        if field in node_out:
+            runs[thread_id][field] = node_out[field]
+
+    if "messages" in node_out:
+        runs[thread_id]["messages"] = [
+            m.content if hasattr(m, "content") else str(m)
+            for m in node_out["messages"]
+        ]
+
+    # Accumulate per-agent token usage and roll up totals. The LangGraph reducer
+    # already merges on the state side; we mirror it here so the run record
+    # (persisted to ChromaDB / shown in dashboard) stays consistent.
+    if "token_usage" in node_out:
+        existing = runs[thread_id].get("token_usage") or {}
+        incoming = node_out["token_usage"] or {}
+        existing.update(incoming)
+        runs[thread_id]["token_usage"] = existing
+
+        total_in   = sum(int(a.get("input_tokens",  0) or 0) for a in existing.values())
+        total_out  = sum(int(a.get("output_tokens", 0) or 0) for a in existing.values())
+        total_cost = sum(float(a.get("cost_usd",   0) or 0) for a in existing.values())
+        total_calls = sum(int(a.get("calls",       0) or 0) for a in existing.values())
+        runs[thread_id]["token_totals"] = {
+            "input_tokens":  total_in,
+            "output_tokens": total_out,
+            "total_tokens":  total_in + total_out,
+            "calls":         total_calls,
+            "cost_usd":      round(total_cost, 6),
+        }
+
+
+async def _drive_graph(thread_id: str, stream_input, rag) -> None:
+    """
+    Drive the LangGraph stream for either an initial run or a resume.
+
+    Handles three terminal states:
+      - interrupt fired           → status="awaiting_approval", capture payload
+      - stream finished cleanly   → status="completed" (or "rejected" if user said no)
+      - exception                 → status="failed"
+    """
+    app_graph = _build_graph()
+    config = {"configurable": {"thread_id": thread_id}}
+
+    interrupt_payload = None
+    for event in app_graph.stream(stream_input, config=config):
+        # `__interrupt__` events surface payloads passed to interrupt() —
+        # they're emitted alongside regular node updates, not as a node update.
+        if "__interrupt__" in event:
+            interrupts = event["__interrupt__"]
+            if interrupts:
+                interrupt_payload = interrupts[0].value
+            continue
+
+        node_name = next(iter(event))
+        node_out = event[node_name] or {}
+        _apply_node_output(thread_id, node_name, node_out)
+        rag.save_run(thread_id, runs[thread_id])
+
+    if interrupt_payload is not None:
+        runs[thread_id]["status"] = "awaiting_approval"
+        runs[thread_id]["interrupt_payload"] = interrupt_payload
+        logger.info("Pipeline paused at human approval — thread %s", thread_id)
+    else:
+        # If the user rejected, human_approved was set to False during resume —
+        # surface that as a distinct status from a clean approve+complete.
+        if runs[thread_id].get("human_approved") is False:
+            runs[thread_id]["status"] = "rejected"
+        else:
+            runs[thread_id]["status"] = "completed"
+        runs[thread_id]["completed_at"] = datetime.now(timezone.utc).isoformat()
+        runs[thread_id].pop("interrupt_payload", None)
+
+    rag.save_run(thread_id, runs[thread_id])
+
+
 async def _execute_pipeline(thread_id: str, model_id: str, environment: str):
     from mlops_agents.rag.store import RAGStore
     rag = RAGStore()
 
-    runs[thread_id]["status"]        = "running"
-    runs[thread_id]["started_at"]    = datetime.now(timezone.utc).isoformat()
-    runs[thread_id]["current_agent"] = "monitor"
-    rag.save_run(thread_id, runs[thread_id])
-
     try:
-        app_graph = _build_graph()
-        config    = {"configurable": {"thread_id": thread_id}}
-
-        initial_state = {
-            "model_id":    model_id,
-            "environment": environment,
-            "messages":    [],
-        }
-
-        for event in app_graph.stream(initial_state, config=config):
-            node_name = list(event.keys())[0]
-            node_out  = event[node_name] or {}
-
-            runs[thread_id]["current_agent"] = node_name
-
-            for field in [
-                "severity", "diagnosis", "recommended_action", "remediation_status",
-                "incident_id", "report", "remediation_action", "remediation_detail",
-                "diagnosis_json", "retrain_prescription", "drifted_features",
-                "similar_incidents", "relevant_runbooks", "notifications_sent",
-            ]:
-                if field in node_out:
-                    runs[thread_id][field] = node_out[field]
-
-            if "messages" in node_out:
-                runs[thread_id]["messages"] = [
-                    m.content if hasattr(m, "content") else str(m)
-                    for m in node_out["messages"]
-                ]
-
-            # Persist to ChromaDB after each update
-            rag.save_run(thread_id, runs[thread_id])
-
-        # Check if paused at human approval (node interruption doesn't raise exception)
-        if runs[thread_id].get("current_agent") == "human_approval" and runs[thread_id].get("human_approved") is None:
-            runs[thread_id]["status"] = "awaiting_approval"
-            logger.info("Pipeline paused at human approval — thread %s", thread_id)
-        else:
-            runs[thread_id]["status"]       = "completed"
-            runs[thread_id]["completed_at"] = datetime.now(timezone.utc).isoformat()
+        runs[thread_id]["status"] = "running"
+        runs[thread_id]["started_at"] = datetime.now(timezone.utc).isoformat()
+        runs[thread_id]["current_agent"] = "monitor"
         rag.save_run(thread_id, runs[thread_id])
 
+        initial_state = {
+            "model_id": model_id,
+            "environment": environment,
+            "messages": [],
+        }
+        await _drive_graph(thread_id, initial_state, rag)
+
     except Exception as exc:
-        exc_name = type(exc).__name__
-        if "GraphInterrupt" in exc_name or "interrupt" in str(exc).lower():
-            runs[thread_id]["status"] = "awaiting_approval"
-            logger.info("Pipeline paused at human approval — thread %s", thread_id)
-        else:
-            runs[thread_id]["status"] = "failed"
-            runs[thread_id]["error"]  = str(exc)
-            logger.error("Pipeline failed for thread %s: %s", thread_id, exc)
+        runs[thread_id]["status"] = "failed"
+        runs[thread_id]["error"] = str(exc)
+        logger.error("Pipeline failed for thread %s: %s", thread_id, exc)
         rag.save_run(thread_id, runs[thread_id])
 
 
 async def _resume_pipeline(thread_id: str, approved: bool):
+    from langgraph.types import Command
     from mlops_agents.rag.store import RAGStore
     rag = RAGStore()
 
-    runs[thread_id]["status"]        = "running"
-    runs[thread_id]["current_agent"] = "remediation"
-    rag.save_run(thread_id, runs[thread_id])
-
     try:
-        app_graph    = _build_graph()
-        config       = {"configurable": {"thread_id": thread_id}}
-        resume_state = {"human_approved": approved}
+        # Self-contained fallback: repopulate cache if cold (e.g. after restart).
+        if thread_id not in runs:
+            run = rag.get_run(thread_id)
+            if not run:
+                logger.error("Resume failed — thread %s not found in memory or ChromaDB", thread_id)
+                return
+            runs[thread_id] = run
 
-        for event in app_graph.stream(resume_state, config=config):
-            node_name = list(event.keys())[0]
-            node_out  = event[node_name] or {}
-            runs[thread_id]["current_agent"] = node_name
-
-            for field in [
-                "remediation_status", "incident_id", "report", "remediation_action",
-                "remediation_detail", "diagnosis_json", "retrain_prescription",
-                "drifted_features", "similar_incidents", "relevant_runbooks",
-                "notifications_sent",
-            ]:
-                if field in node_out:
-                    runs[thread_id][field] = node_out[field]
-
-            if "messages" in node_out:
-                runs[thread_id]["messages"] = [
-                    m.content if hasattr(m, "content") else str(m)
-                    for m in node_out["messages"]
-                ]
-
-            # Persist to ChromaDB after each update
-            rag.save_run(thread_id, runs[thread_id])
-
-        runs[thread_id]["status"]         = "completed"
-        runs[thread_id]["completed_at"]   = datetime.now(timezone.utc).isoformat()
+        runs[thread_id]["status"] = "running"
         runs[thread_id]["human_approved"] = approved
         rag.save_run(thread_id, runs[thread_id])
 
+        # `Command(resume=...)` is the recommended way to resume a graph paused
+        # on `interrupt()`. The value becomes the return value of the interrupt()
+        # call inside human_approval_node.
+        await _drive_graph(thread_id, Command(resume=approved), rag)
+
     except Exception as exc:
-        runs[thread_id]["status"] = "failed"
-        runs[thread_id]["error"]  = str(exc)
+        if thread_id in runs:
+            runs[thread_id]["status"] = "failed"
+            runs[thread_id]["error"] = str(exc)
+            rag.save_run(thread_id, runs[thread_id])
         logger.error("Resume failed for thread %s: %s", thread_id, exc)
-        rag.save_run(thread_id, runs[thread_id])
 
 # ── pipeline run endpoints ────────────────────────────────────────────────────
 
@@ -371,6 +401,127 @@ async def list_incidents(limit: int = 50, severity: str = None):
 
     except Exception as e:
         raise HTTPException(500, f"ChromaDB query failed: {e}")
+
+# ── retrain logs endpoint ─────────────────────────────────────────────────────
+
+def _resolve_active_log() -> tuple[Path | None, dict | None]:
+    """Read the retrain lockfile and return (log_path, lock_data) if active."""
+    if not RETRAIN_LOCK.exists():
+        return None, None
+    try:
+        lock = json.loads(RETRAIN_LOCK.read_text())
+    except Exception:
+        return None, None
+    p = lock.get("log_path")
+    return (Path(p) if p else None), lock
+
+
+def _latest_log() -> Path | None:
+    """Most recently modified file in RETRAIN_LOG_DIR, or None if empty."""
+    if not RETRAIN_LOG_DIR.exists():
+        return None
+    logs = sorted(
+        RETRAIN_LOG_DIR.glob("*.log"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    return logs[0] if logs else None
+
+
+@app.get("/retrain/logs")
+async def retrain_logs(tail: int = 200, file: str | None = None):
+    """
+    Return the tail of a retrain log.
+
+    - `file`: explicit log filename under data/logs/retrain/ (no path traversal).
+              When omitted, prefer the active run's log from the lockfile,
+              else fall back to the most recently modified log.
+    - `tail`: number of trailing lines to return (default 200, capped at 5000).
+    """
+    tail = max(1, min(int(tail), 5000))
+
+    # explicit filename takes precedence
+    if file:
+        # sanitise — refuse anything with a separator
+        if "/" in file or "\\" in file or ".." in file:
+            raise HTTPException(400, "Invalid log filename")
+        log_path = RETRAIN_LOG_DIR / file
+        source = "explicit"
+    else:
+        active_path, lock = _resolve_active_log()
+        if active_path and active_path.exists():
+            log_path = active_path
+            source = "active"
+        else:
+            log_path = _latest_log()
+            source = "latest"
+
+    if not log_path or not log_path.exists():
+        return {
+            "status": "no_logs",
+            "log_path": None,
+            "lines": [],
+            "active": False,
+            "tail": tail,
+        }
+
+    # tail the file — read whole thing then take last N lines (logs are small,
+    # avoids complexity of seeking from end across encodings).
+    try:
+        content = log_path.read_text(errors="replace").splitlines()
+    except Exception as exc:
+        raise HTTPException(500, f"Could not read log: {exc}")
+
+    lines = content[-tail:] if len(content) > tail else content
+
+    # Is a retrain currently in flight against this log?
+    _, lock = _resolve_active_log()
+    active = bool(
+        lock and lock.get("log_path") == str(log_path) and _pid_alive(lock.get("pid"))
+    )
+
+    return {
+        "status":   "active" if active else "idle",
+        "log_path": str(log_path),
+        "log_name": log_path.name,
+        "source":   source,
+        "active":   active,
+        "size_bytes":  log_path.stat().st_size,
+        "modified_at": datetime.fromtimestamp(log_path.stat().st_mtime, tz=timezone.utc).isoformat(),
+        "total_lines": len(content),
+        "tail":     len(lines),
+        "lines":    lines,
+    }
+
+
+def _pid_alive(pid) -> bool:
+    if not pid:
+        return False
+    try:
+        os.kill(int(pid), 0)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
+@app.get("/retrain/logs/list")
+async def list_retrain_logs(limit: int = 20):
+    """List recent retrain log files (newest first)."""
+    if not RETRAIN_LOG_DIR.exists():
+        return []
+    logs = sorted(
+        RETRAIN_LOG_DIR.glob("*.log"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )[:max(1, int(limit))]
+    return [
+        {
+            "name":        p.name,
+            "size_bytes":  p.stat().st_size,
+            "modified_at": datetime.fromtimestamp(p.stat().st_mtime, tz=timezone.utc).isoformat(),
+        }
+        for p in logs
+    ]
 
 # ── dataset endpoints ─────────────────────────────────────────────────────────
 
@@ -585,7 +736,7 @@ if __name__ == "__main__":
     uvicorn.run(
         "api.main:app",
         host="0.0.0.0",
-        port=int(os.getenv("API_PORT", "8000")),
+        port=8000,
         reload=True,
         log_level="info",
     )
