@@ -4,12 +4,14 @@ import json
 import logging
 import os
 from typing import Any, Literal, Optional
-from langchain_ollama import ChatOllama
+from mlops_agents.llm_manager import get_llm
 from langchain_core.messages import HumanMessage, SystemMessage
 from pydantic import BaseModel, Field
 
-from state import AgentState
+from mlops_agents.state import AgentState
 from mlops_agents.rag.store import RAGStore
+from mlops_agents.tools.histogram_drift import compute_histogram_drift
+from mlops_agents.tools.token_tracker import TokenUsageHandler
 
 logger = logging.getLogger(__name__)
 
@@ -118,11 +120,7 @@ class DiagnosisOutput(BaseModel):
 
 
 def _build_diagnosis_llm():
-    model_name = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
-    ollama_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
-    return ChatOllama(
-        model=model_name, base_url=ollama_url, temperature=0
-    ).with_structured_output(DiagnosisOutput)
+    return get_llm(temperature=0).with_structured_output(DiagnosisOutput)
 
 
 def _format_similar_incidents(incidents: list) -> str:
@@ -156,7 +154,9 @@ def diagnosis_agent(state: AgentState, rag: RAGStore) -> AgentState:
     environment: str = state.get("environment", "production")
 
     logger.info(
-        "Diagnosis Agent: Executing hybrid analysis for model: %s", model_id)
+        "[Diagnosis] starting — model_id=%s environment=%s severity=%s",
+        model_id, environment, severity,
+    )
 
     # Short-circuit logic if monitor flags no anomalies
     if severity == "none":
@@ -171,6 +171,27 @@ def diagnosis_agent(state: AgentState, rag: RAGStore) -> AgentState:
     ref_histograms = metrics.get("reference_histograms")
     prod_histograms = metrics.get("production_histograms")
 
+    # ── Deterministic drift quantification via @tool ────────────────────────
+    drift = compute_histogram_drift.invoke({
+        "reference": ref_histograms or {},
+        "production": prod_histograms or {},
+    })
+    logger.info(
+        "[Diagnosis] drift — %s drifted_features=%s",
+        drift["summary"], drift["drifted_features"][:10],
+    )
+
+    # Compact, LLM-readable rendering of the drift result. Raw histograms are
+    # no longer pushed into the prompt — the math already happened in code.
+    if drift["top_drifted"]:
+        drift_table = "\n".join(
+            f"- {row['feature']}: PSI={row['psi']:.3f} KS={row['ks']:.3f} "
+            f"mean_shift_z={row['mean_shift_z']:.2f} → {row['drift_level']}"
+            for row in drift["top_drifted"]
+        )
+    else:
+        drift_table = "No features exceed the moderate-drift threshold (PSI ≥ 0.10)."
+
     # Build context lookup keys for RAG spaces
     query_text = (
         f"Model {model_id} in {environment}. Severity: {severity}. "
@@ -184,7 +205,12 @@ def diagnosis_agent(state: AgentState, rag: RAGStore) -> AgentState:
     trend = rag.query_recent_metrics(
         model_id=model_id, n_results=5, environment=environment)
 
-    system_prompt = "You are an autonomous MLOps Diagnostic engine. Synthesize incident logs, vector runbooks, and abstract feature distributions to resolve root cause anomalies into structured formats."
+    logger.info(
+        "[Diagnosis] RAG retrieval — similar_incidents=%d runbooks=%d trend_points=%d",
+        len(similar_incidents or []), len(relevant_runbooks or []), len(trend or []),
+    )
+
+    system_prompt = "You are an autonomous MLOps Diagnostic engine. Synthesize incident logs, vector runbooks, and pre-computed drift statistics to resolve root cause anomalies into structured formats."
 
     prompt = f"""## Active Operational Incident Context
 Model Name: {model_id}
@@ -194,12 +220,15 @@ Severity Tier: {severity}
 ### Dynamic Performance Telemetry Signals
 {json.dumps({k: v for k, v in metrics.items() if k not in ['reference_histograms', 'production_histograms']}, indent=2)}
 
-### Statistical Feature Distribution Shapes (Zero-PII Summaries)
-Reference Baseline Histograms (Training Set Footprint):
-{json.dumps(ref_histograms) if ref_histograms else "UNAVAILABLE"}
+### Feature Distribution Drift (pre-computed via PSI / KS / mean-shift)
+Summary: {drift["summary"]}
 
-Live Production Histograms (Recent Sliding Buffer Footprint):
-{json.dumps(prod_histograms) if prod_histograms else "UNAVAILABLE"}
+Top drifted features (PSI ≥ 0.10 — production vs. training):
+{drift_table}
+
+Drift bands: PSI < 0.10 stable · 0.10–0.25 moderate · ≥ 0.25 significant.
+Use these statistics as ground truth — do NOT re-derive them. The list above
+is sorted by PSI descending.
 
 ### Institutional Knowledge Base (RAG Matches)
 Similar Past Operational Outages:
@@ -224,27 +253,62 @@ NOTE: The possible actions you can recommend are strictly limited to the followi
 Instructions: Formulate a cohesive root cause evaluation by contrasting data histograms against baseline shapes and historical runbooks. Output strictly via the required JSON target model configuration layout."""
 
     llm = _build_diagnosis_llm()
+    tracker = TokenUsageHandler()
 
     try:
-        result: DiagnosisOutput = llm.invoke([
-            SystemMessage(content=system_prompt),
-            HumanMessage(content=prompt)
-        ])
+        result: DiagnosisOutput = llm.invoke(
+            [
+                SystemMessage(content=system_prompt),
+                HumanMessage(content=prompt),
+            ],
+            config={"callbacks": [tracker]},
+        )
     except Exception as exc:
-        logger.error(
-            "Structured LLM compilation failure. Executing safe hardcoded fallback: %s", exc)
+        logger.info(
+            "[Diagnosis] structured LLM call failed — falling back to investigate. exc=%s", exc)
         return {
             **state,
             "diagnosis": "Fallback: Suspected performance degradation triggered safety loop.",
+            "token_usage": {"diagnosis": tracker.summary()},
             "remediation_action": "investigate"
         }
 
-    print(f"[Diagnosis Agent] LLM Structured Output: {result.model_dump_json()}")
+    logger.info(
+        "[Diagnosis] result — root_cause=%r category=%s action=%s confidence=%.2f",
+        result.root_cause, result.root_cause_category,
+        result.recommended_action, result.confidence,
+    )
+    logger.info("[Diagnosis] full structured output: %s", result.model_dump_json())
 
-    # Materialize prescription parameters for safe hand-off to remediation agent tools
+    # Materialize prescription parameters for safe hand-off to remediation agent tools.
+    # The tool's drifted_features list is the authoritative one — overlay it onto
+    # the LLM's prescription so retraining targets the features the maths flagged.
     prescription = result.retrain_prescription.model_dump(
     ) if result.retrain_prescription else None
-    drifted = prescription.get("drifted_features", []) if prescription else []
+    drifted = drift["drifted_features"] or (
+        prescription.get("drifted_features", []) if prescription else []
+    )
+    if prescription is not None:
+        prescription["drifted_features"] = drifted
+        logger.info(
+            "[Diagnosis] retrain prescription — strategy=%s window_days=%s "
+            "drift_period_weight=%s exclude_before=%r refit_preprocessors=%s "
+            "optimize_for=%s target_recall=%s target_roc_auc=%s "
+            "deployment_strategy=%s canary_pct=%s shadow_hours=%s "
+            "drifted_features=%s",
+            prescription.get("data_strategy"),
+            prescription.get("window_days"),
+            prescription.get("drift_period_weight"),
+            prescription.get("exclude_before"),
+            prescription.get("refit_preprocessors"),
+            prescription.get("optimize_for"),
+            prescription.get("target_recall"),
+            prescription.get("target_roc_auc"),
+            prescription.get("deployment_strategy"),
+            prescription.get("canary_traffic_pct"),
+            prescription.get("shadow_period_hours"),
+            drifted,
+        )
 
     # Map the output tokens to fit your updated remediation routing signatures
     action_map = {
@@ -256,6 +320,22 @@ Instructions: Formulate a cohesive root cause evaluation by contrasting data his
     workflow_action_token = action_map.get(
         result.recommended_action, "investigate")
 
+    logger.info(
+        "[Diagnosis] complete — workflow_action=%s drifted_features=%s prescription=%s",
+        workflow_action_token,
+        drifted,
+        "present" if prescription else "none",
+    )
+
+    token_summary = tracker.summary()
+    logger.info(
+        "[Diagnosis] token usage — in=%d out=%d total=%d calls=%d model=%s cost=$%.6f",
+        token_summary["input_tokens"], token_summary["output_tokens"],
+        token_summary["total_tokens"], token_summary["calls"],
+        token_summary["model"], token_summary["cost_usd"],
+    )
+
+    per_feature = drift.get("per_feature", {})
     return {
         **state,
         "diagnosis":            result.root_cause,
@@ -266,8 +346,11 @@ Instructions: Formulate a cohesive root cause evaluation by contrasting data his
         "recommended_action":   result.recommended_action,
         "retrain_prescription": prescription,
         "drifted_features":     drifted,
+        "per_feature_psi":      {f: m["psi"] for f, m in per_feature.items()},
+        "per_feature_ks":       {f: m["ks"]  for f, m in per_feature.items()},
         "similar_incidents":    similar_incidents,
         "relevant_runbooks":    relevant_runbooks,
+        "token_usage":          {"diagnosis": token_summary},
         "messages": state.get("messages", []) + [HumanMessage(content=f"[Diagnosis] Cause='{result.root_cause}' Category={result.root_cause_category} Action={result.recommended_action}")
         ]
         }

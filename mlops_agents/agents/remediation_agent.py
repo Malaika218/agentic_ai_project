@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from langchain_core.messages import HumanMessage
 
-from state import AgentState
+from mlops_agents.state import AgentState
 from mlops_agents.tools.mcp_tools import (
     trigger_retraining_pipeline,
     rollback_deployment,
@@ -49,9 +49,8 @@ def remediation_agent(state: AgentState) -> AgentState:
     is_dry_run = os.getenv("DRY_RUN", "false").lower() == "true"
 
     logger.info(
-        "Remediation Agent: %s action='%s' for %s (%s)",
-        "[DRY RUN]" if is_dry_run else "Executing",
-        action, model_id, environment,
+        "[Remediation] starting — action=%s model_id=%s environment=%s severity=%s dry_run=%s",
+        action, model_id, environment, severity, is_dry_run,
     )
 
     if is_dry_run:
@@ -93,6 +92,11 @@ def remediation_agent(state: AgentState) -> AgentState:
 
     status: str = result.get("status", "failed")
     detail: str = result.get("detail", "")
+
+    logger.info(
+        "[Remediation] complete — action=%s status=%s detail=%s",
+        action, status, detail[:200] if detail else "",
+    )
 
     return {
         **state,
