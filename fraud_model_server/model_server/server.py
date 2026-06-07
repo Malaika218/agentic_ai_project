@@ -37,10 +37,10 @@ from pathlib import Path
 from datetime import datetime, timezone, timedelta
 from collections import deque
 from contextlib import asynccontextmanager
-from typing import Any
+from typing import Any, Optional
 
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 from mlflow.tracking import MlflowClient
 
@@ -50,7 +50,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ── config ────────────────────────────────────────────────────────────────────
-MODEL_DIR    = Path(os.getenv("MODEL_DIR", "./model"))
+MODEL_DIR    = Path(__file__).parent / "model"
 MODEL_PATH   = MODEL_DIR / "fraud_classifier.joblib"
 AMOUNT_SCALER_PATH = MODEL_DIR / "amount_scaler.joblib"
 TIME_SCALER_PATH   = MODEL_DIR / "time_scaler.joblib"
@@ -147,21 +147,24 @@ def mlflow_telemetry_worker():
                 "std":        float(arr[:, i].std()),
             }
 
-        # 3. Asynchronously push to the dynamically resolved model registry version tags
+        # 3. Asynchronously push to the dynamically resolved model registry version tags.
+        # NOTE: MLflow's `active_run()` is process-global, not thread-local. Using
+        # `with mlflow.start_run(...)` here races against the metrics-snapshot run
+        # created inside compute_current_metrics() when both fire near-simultaneously.
+        # We attach artifacts to the existing training run via the client API
+        # directly, which never touches the global active-run pointer.
         try:
             with tempfile.TemporaryDirectory() as tmpdir:
                 artifact_path = Path(tmpdir) / "latest_production_histogram.json"
                 artifact_path.write_text(json.dumps(production_histograms))
 
-                with mlflow.start_run(run_id=active_run_id):
-                    mlflow.log_artifact(str(artifact_path))
-                    # optional: keep a small pointer on the model version
-                    client.set_model_version_tag(
-                        name=model_name,
-                        version=active_version,
-                        key="latest_production_histogram_run_id",
-                        value=mlflow.active_run().info.run_id,
-                    )
+                client.log_artifact(run_id=active_run_id, local_path=str(artifact_path))
+                client.set_model_version_tag(
+                    name=model_name,
+                    version=active_version,
+                    key="latest_production_histogram_run_id",
+                    value=active_run_id,
+                )
         except Exception as exc:
             print(f"[Telemetry Worker Error] Failed to upload metrics to version {active_version}: {exc}")
 
@@ -188,8 +191,125 @@ def load_model_from_disk():
     return model, amount_scaler, time_scaler, metadata
 
 
+def _retry_download(label: str, fn, attempts: int = 3, delay_seconds: int = 10):
+    """
+    Run a flaky MLflow artifact download with backoff. Returns the call result
+    on success or re-raises the last exception after `attempts` retries.
+    """
+    last_exc = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except Exception as exc:
+            last_exc = exc
+            if attempt < attempts:
+                print(
+                    f"[watcher] {label} attempt {attempt}/{attempts} failed: {exc} "
+                    f"— retrying in {delay_seconds}s"
+                )
+                time.sleep(delay_seconds)
+            else:
+                print(f"[watcher] {label} failed after {attempts} attempts: {exc}")
+    raise last_exc
+
+
+def _check_and_swap_latest_retrain() -> bool:
+    """
+    Find the latest retrain run in MLflow and atomically swap model + scalers
+    + metadata into the server's state.
+
+    Returns:
+        True  → a swap occurred (new run picked up)
+        False → no new run (already on the latest) or no retrain runs exist
+
+    Exceptions during artifact download/load propagate to the caller so it can
+    decide whether to retry (background watcher) or proceed anyway (startup).
+    """
+    client     = MlflowClient()
+    experiment = client.get_experiment_by_name(EXPERIMENT)
+    if not experiment:
+        return False
+
+    runs = client.search_runs(
+        experiment_ids=[experiment.experiment_id],
+        filter_string=(
+            f"tags.triggered_by IN ('remediation_agent','manual') and tags.model_id = '{MODEL_ID}'"
+        ),
+        order_by=["start_time DESC"],
+        max_results=1,
+    )
+    if not runs:
+        return False
+
+    latest        = runs[0]
+    latest_run_id = latest.info.run_id
+
+    with state_lock:
+        if latest_run_id == state.get("loaded_run_id"):
+            return False
+
+        print(f"\n[watcher] new retrained model — run {latest_run_id}")
+
+        # 1. Model (hard requirement — failure raises and aborts the swap)
+        new_model = _retry_download(
+            f"model download (run {latest_run_id[:8]})",
+            lambda: mlflow.sklearn.load_model(f"runs:/{latest_run_id}/model"),
+        )
+
+        # 2. Scalers (HARD requirement — train.py refits these every run.
+        # If we keep stale v(N-1) scalers, v(N) LR coefficients receive
+        # mis-scaled features and the model silently underperforms.)
+        tmpdir = tempfile.mkdtemp()
+        _retry_download(
+            f"amount_scaler download (run {latest_run_id[:8]})",
+            lambda: client.download_artifacts(latest_run_id, "amount_scaler.joblib", tmpdir),
+        )
+        _retry_download(
+            f"time_scaler download (run {latest_run_id[:8]})",
+            lambda: client.download_artifacts(latest_run_id, "time_scaler.joblib", tmpdir),
+        )
+        new_amount_scaler = joblib.load(Path(tmpdir) / "amount_scaler.joblib")
+        new_time_scaler   = joblib.load(Path(tmpdir) / "time_scaler.joblib")
+
+        # 3. Metadata (soft requirement — fall back to existing if download fails)
+        metadata = state["metadata"]
+        try:
+            _retry_download(
+                f"metadata.json download (run {latest_run_id[:8]})",
+                lambda: client.download_artifacts(latest_run_id, "metadata.json", tmpdir),
+            )
+            metadata = json.loads((Path(tmpdir) / "metadata.json").read_text())
+        except Exception as e:
+            print(f"[watcher] warning: failed to download metadata.json for run {latest_run_id}, using existing metadata")
+            print(f"[watcher] error: {e}")
+
+        # 4. Atomic swap — model, scalers, and metadata all move together.
+        state["model"]          = new_model
+        state["amount_scaler"]  = new_amount_scaler
+        state["time_scaler"]    = new_time_scaler
+        state["loaded_run_id"]  = latest_run_id
+        state["metadata"]       = metadata
+
+        # 5. Drain the prediction window. Records left from the previous model
+        # would otherwise dominate compute_current_metrics for up to
+        # `maxlen` predictions (≈8–80 min depending on replay rate), causing
+        # the monitor to attribute prior-model behaviour to the new model and
+        # potentially trigger a spurious retrain. A clean window means the
+        # next snapshot returns the training-time fallback from metadata until
+        # enough fresh labelled records accumulate.
+        state["prediction_history"].clear()
+        state["feature_history"].clear()
+        state["stats"]["total_predictions"] = 0
+        state["stats"]["fraud_detected"]    = 0
+        state["stats"]["errors"]            = 0
+        state["stats"]["latencies_ms"].clear()
+
+        print(f"[watcher] model + scalers hot-reloaded; prediction window cleared.\n")
+        return True
+
+
 def watch_for_retrain():
-    """Background thread — polls MLflow for a model tagged triggered_by=remediation_agent."""
+    """Background thread — polls MLflow on RELOAD_CHECK intervals."""
     token = os.getenv("MLFLOW_TRACKING_TOKEN", "")
     if token:
         os.environ["MLFLOW_TRACKING_TOKEN"] = token
@@ -198,46 +318,7 @@ def watch_for_retrain():
     while True:
         time.sleep(RELOAD_CHECK)
         try:
-            client     = MlflowClient()
-            experiment = client.get_experiment_by_name(EXPERIMENT)
-            if not experiment:
-                continue
-
-            runs = client.search_runs(
-                experiment_ids=[experiment.experiment_id],
-                filter_string=(
-                    f"tags.triggered_by IN ('remediation_agent','manual') and tags.model_id = '{MODEL_ID}'"
-                ),
-                order_by=["start_time DESC"],
-                max_results=1,
-            )
-            if not runs:
-                continue
-
-            latest        = runs[0]
-            latest_run_id = latest.info.run_id
-
-            with state_lock:
-                if latest_run_id == state["loaded_run_id"]:
-                    continue
-
-                print(f"\n[watcher] new retrained model — run {latest_run_id}")
-                new_model = mlflow.sklearn.load_model(f"runs:/{latest_run_id}/model")
-                metadata = state["metadata"]
-                try:
-                    tmpdir = tempfile.mkdtemp()
-                    client.download_artifacts(latest_run_id, "metadata.json", tmpdir)
-                    metadata_path = Path(tmpdir) / "metadata.json"
-                    metadata = json.loads(metadata_path.read_text())
-                except Exception as e:
-                    print(f"[watcher] warning: failed to download metadata.json for run {latest_run_id}, using existing metadata")
-                    print(f"[watcher] error: {e}")
-
-                state["model"]           = new_model
-                state["loaded_run_id"]   = latest_run_id
-                state["metadata"] = metadata
-                print(f"[watcher] model hot-reloaded.\n")
-
+            _check_and_swap_latest_retrain()
         except Exception as e:
             print(f"[watcher] error: {e}")
 
@@ -265,6 +346,20 @@ async def lifespan(app: FastAPI):
     print(f"Train samples : {metadata['train_samples']}")
     print(f"Trained at    : {metadata['trained_at']}")
 
+    # Immediate MLflow sync — the on-disk model may be stale relative to what
+    # an external trainer (Databricks, another worker) has registered since the
+    # last restart. If MLflow has a newer retrain, swap to it before serving
+    # any traffic. If MLflow is unreachable or empty, we keep the on-disk model
+    # and the background watcher will retry on its own cadence.
+    mlflow.set_tracking_uri(MLFLOW_URI)
+    try:
+        if _check_and_swap_latest_retrain():
+            print("[watcher] startup: synced to latest MLflow retrain")
+        else:
+            print("[watcher] startup: on-disk model is current (no newer MLflow run)")
+    except Exception as e:
+        print(f"[watcher] startup: MLflow sync failed, continuing with on-disk model — {e}")
+
     t = threading.Thread(target=watch_for_retrain, daemon=True)
     t.start()
     print(f"[watcher] polling MLflow every {RELOAD_CHECK}s for retrained model\n")
@@ -283,6 +378,10 @@ app = FastAPI(
 # ── pydantic models ───────────────────────────────────────────────────────────
 
 class Transaction(BaseModel):
+    # Allow the generator to send `_true_label` alongside the features — the
+    # field name can't start with underscore in Python, hence the alias.
+    model_config = ConfigDict(populate_by_name=True)
+
     v1: float;  v2: float;  v3: float;  v4: float;  v5: float
     v6: float;  v7: float;  v8: float;  v9: float;  v10: float
     v11: float; v12: float; v13: float; v14: float; v15: float
@@ -291,6 +390,9 @@ class Transaction(BaseModel):
     v26: float; v27: float; v28: float
     amount: float = Field(..., ge=0)
     time:   float = Field(..., ge=0)
+    # Ground-truth label, supplied by the dataset replayer for evaluation.
+    # None in real production traffic — handled gracefully by metric code.
+    true_label: Optional[int] = Field(default=None, alias="_true_label")
 
 class MCPCallRequest(BaseModel):
     tool:   str
@@ -359,7 +461,7 @@ def compute_current_metrics() -> dict:
         return {
             "fraud_rate":  0.0,
             "latency_ms":  0.0,
-            "error_rate":  error_rate,   # real — from serving stats even at zero
+            "error_rate":  error_rate,
             "sample_size": 0,
             "precision":   base.get("precision", 0.0),
             "recall":      base.get("recall", 0.0),
@@ -368,31 +470,71 @@ def compute_current_metrics() -> dict:
             "accuracy":    base.get("accuracy", 0.0),
         }
 
-    # ── live computation ──────────────────────────────────────────────────────
-    high_conf = sum(
-        1 for h in history
-        if h["fraud_prob"] > 0.7 or h["fraud_prob"] < 0.3
-    )
-    accuracy   = round(high_conf / len(history), 4)
+    # ── window-wide stats (label-independent) ────────────────────────────────
     fraud_rate = round(
         sum(1 for h in history if h["prediction"] == 1) / len(history), 4
     )
-
     latencies   = list(stats["latencies_ms"])
     p95_latency = (
         round(float(np.percentile(latencies, 95)), 2)
         if latencies else 0.0
     )
 
+    # ── classification metrics from labelled records ─────────────────────────
+    # Records without a `true_label` (real production traffic) are skipped —
+    # those metrics fall back to training-time values from the registry.
+    labelled = [h for h in history if h.get("true_label") is not None]
+
+    if not labelled:
+        return {
+            "fraud_rate":  fraud_rate,
+            "latency_ms":  p95_latency,
+            "error_rate":  error_rate,
+            "sample_size": len(history),
+            "labelled_size": 0,
+            "precision":   base.get("precision", 0.0),
+            "recall":      base.get("recall", 0.0),
+            "f1":          base.get("f1", 0.0),
+            "roc_auc":     base.get("roc_auc", 0.0),
+            "accuracy":    base.get("accuracy", 0.0),
+        }
+
+    y_true = np.array([int(h["true_label"]) for h in labelled])
+    y_pred = np.array([int(h["prediction"]) for h in labelled])
+    y_prob = np.array([float(h["fraud_prob"]) for h in labelled])
+
+    tp = int(((y_pred == 1) & (y_true == 1)).sum())
+    fp = int(((y_pred == 1) & (y_true == 0)).sum())
+    fn = int(((y_pred == 0) & (y_true == 1)).sum())
+
+    accuracy  = round(float((y_pred == y_true).mean()), 4)
+    precision = round(tp / (tp + fp), 4) if (tp + fp) > 0 else 0.0
+    recall    = round(tp / (tp + fn), 4) if (tp + fn) > 0 else 0.0
+    f1 = (
+        round(2 * precision * recall / (precision + recall), 4)
+        if (precision + recall) > 0 else 0.0
+    )
+
+    # roc_auc requires both classes present in y_true — otherwise undefined.
+    try:
+        from sklearn.metrics import roc_auc_score
+        roc_auc = (
+            round(float(roc_auc_score(y_true, y_prob)), 4)
+            if len(np.unique(y_true)) == 2 else base.get("roc_auc", 0.0)
+        )
+    except Exception:
+        roc_auc = base.get("roc_auc", 0.0)
+
     return {
         "fraud_rate":  fraud_rate,
         "latency_ms":  p95_latency,
         "error_rate":  error_rate,
         "sample_size": len(history),
-        "precision":   base.get("precision", 0.0),
-        "recall":      base.get("recall", 0.0),
-        "f1":          base.get("f1", 0.0),
-        "roc_auc":     base.get("roc_auc", 0.0),
+        "labelled_size": len(labelled),
+        "precision":   precision,
+        "recall":      recall,
+        "f1":          f1,
+        "roc_auc":     roc_auc,
         "accuracy":    accuracy,
     }
 
@@ -408,6 +550,7 @@ async def predict(tx: Transaction):
         record = {
             "transaction_id": tx_id,
             "timestamp":      datetime.now(timezone.utc).isoformat(),
+            "true_label":     tx.true_label,  # None for real production traffic
             **result,
         }
 
@@ -637,7 +780,7 @@ if __name__ == "__main__":
     uvicorn.run(
         "server:app",
         host="0.0.0.0",
-        port=int(os.getenv("PORT", "8080")),
+        port=8080,
         reload=False,
         log_level="info",
     )
