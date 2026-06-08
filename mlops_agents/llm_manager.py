@@ -57,7 +57,7 @@ def _google_llm(temperature: float, **kwargs: Any) -> BaseChatModel:
         )
 
     return ChatGoogleGenerativeAI(
-        model=os.getenv("GOOGLE_MODEL", "gemini-2.0-flash"),
+        model=os.getenv("GOOGLE_MODEL", "gemini-2.5-flash"),
         google_api_key=api_key,
         temperature=temperature,
         **kwargs,
